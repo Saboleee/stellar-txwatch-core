@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use std::{fs, path::Path};
+use std::{fmt, fs, path::Path};
 
 // ── Network ───────────────────────────────────────────────────────────────────
 
@@ -45,6 +45,12 @@ impl Network {
             Network::Testnet   => "https://stellar.expert/explorer/testnet",
             Network::Futurenet => "https://stellar.expert/explorer/futurenet",
         }
+    }
+}
+
+impl fmt::Display for Network {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
