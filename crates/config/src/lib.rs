@@ -288,6 +288,26 @@ mod tests {
     }
 
     #[test]
+    fn network_horizon_urls_are_distinct() {
+        let mainnet = Network::Mainnet.horizon_base_url();
+        let testnet = Network::Testnet.horizon_base_url();
+        let futurenet = Network::Futurenet.horizon_base_url();
+        assert_ne!(mainnet, testnet);
+        assert_ne!(mainnet, futurenet);
+        assert_ne!(testnet, futurenet);
+    }
+
+    #[test]
+    fn network_explorer_urls_are_distinct() {
+        let mainnet = Network::Mainnet.explorer_base_url();
+        let testnet = Network::Testnet.explorer_base_url();
+        let futurenet = Network::Futurenet.explorer_base_url();
+        assert_ne!(mainnet, testnet);
+        assert_ne!(mainnet, futurenet);
+        assert_ne!(testnet, futurenet);
+    }
+
+    #[test]
     fn rejects_poll_interval_over_max() {
         let raw = r#"
             poll_interval_seconds = 9999
