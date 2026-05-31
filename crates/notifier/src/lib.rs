@@ -91,6 +91,7 @@ pub fn test_payload(label: &str, webhook_url: &str) -> AlertPayload {
         transaction_hash: "0000000000000000000000000000000000000000000000000000000000000000".into(),
         function_name:    Some("test".into()),
         amount_xlm:       None,
+        fee_charged_stroops: None,
         timestamp:        Utc::now().timestamp(),
         horizon_link:     format!(
             "https://horizon-testnet.stellar.org/transactions/\
@@ -120,6 +121,7 @@ mod tests {
             transaction_hash: "abc123".into(),
             function_name:    None,
             amount_xlm:       None,
+            fee_charged_stroops: None,
             timestamp:        1_700_000_000,
             horizon_link:     "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             explorer_link:    "https://stellar.expert/explorer/testnet/tx/abc123".into(),

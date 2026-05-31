@@ -84,6 +84,8 @@ pub struct AlertPayload {
     pub function_name:    Option<String>,
     /// Amount in whole XLM (stroops / 10_000_000), present for LargeTransfer.
     pub amount_xlm:       Option<u64>,
+    /// Fee charged in stroops.
+    pub fee_charged_stroops: Option<u64>,
     /// Unix timestamp (seconds).
     pub timestamp:        i64,
     pub horizon_link:     String,
@@ -121,6 +123,7 @@ pub fn evaluate(
                     transaction_hash: tx.hash.clone(),
                     function_name:    tx.function_name.clone(),
                     amount_xlm:       tx.amount_stroops.map(|s| s / 10_000_000),
+                    fee_charged_stroops: tx.fee_charged_stroops,
                     timestamp,
                     horizon_link:     horizon_link.clone(),
                     explorer_link:    explorer_link.clone(),
