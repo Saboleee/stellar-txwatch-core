@@ -61,8 +61,14 @@ struct Counters {
 /// Logs a summary every 60 seconds: contracts watched, transactions processed,
 /// alerts fired.
 pub async fn run(cfg: AppConfig) -> Result<()> {
+    // Build HTTP client with connection pool tuning options.
+    let max_idle = cfg.http_pool_max_idle_per_host.unwrap_or(10);
+    let keepalive_secs = cfg.http_tcp_keepalive_secs.unwrap_or(30);
+
     let client = Client::builder()
         .timeout(Duration::from_secs(15))
+        .pool_max_idle_per_host(max_idle)
+        .tcp_keepalive(Some(Duration::from_secs(keepalive_secs)))
         .build()
         .context("failed to build HTTP client")?;
 
