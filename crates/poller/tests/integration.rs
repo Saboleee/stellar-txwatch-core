@@ -344,3 +344,79 @@ async fn cursor_advances_after_each_transaction() {
 
     assert_eq!(cursors.get(contract_id).map(String::as_str), Some("300"));
 }
+
+/// Two contracts maintain independent cursors across a poll cycle.
+#[tokio::test]
+async fn multiple_contracts_maintain_independent_cursors() {
+    let horizon = MockServer::start().await;
+
+    let contract_a_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let contract_b_id = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+
+    // Mock: contract A returns transaction with paging_token "token_a"
+    Mock::given(method("GET"))
+        .and(path_regex(format!("/accounts/{}/transactions", contract_a_id).as_str()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(tx_page_json("hash_a", "token_a", true)),
+        )
+        .mount(&horizon)
+        .await;
+
+    // Mock: contract B returns transaction with paging_token "token_b"
+    Mock::given(method("GET"))
+        .and(path_regex(format!("/accounts/{}/transactions", contract_b_id).as_str()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(tx_page_json("hash_b", "token_b", true)),
+        )
+        .mount(&horizon)
+        .await;
+
+    // Mock: operations for both contracts return empty (no Soroban details)
+    Mock::given(method("GET"))
+        .and(path_regex("/transactions/.*/operations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_page_json()))
+        .mount(&horizon)
+        .await;
+
+    // Simulate poller cursors and contract definitions
+    let mut cursors: HashMap<String, String> = HashMap::new();
+    cursors.insert(contract_a_id.to_string(), "now".to_string());
+    cursors.insert(contract_b_id.to_string(), "now".to_string());
+
+    let client = Client::new();
+
+    // Fetch for contract A
+    let url_a = format!(
+        "{}/accounts/{}/transactions?cursor=now&order=asc&limit=200",
+        horizon.uri(),
+        contract_a_id
+    );
+    #[derive(serde::Deserialize)]
+    struct Page { _embedded: Emb }
+    #[derive(serde::Deserialize)]
+    struct Emb  { records: Vec<txwatch_rules::HorizonTransaction> }
+
+    let page_a: Page = client.get(&url_a).send().await.unwrap().json().await.unwrap();
+    if !page_a._embedded.records.is_empty() {
+        let token = page_a._embedded.records[0].paging_token.clone();
+        cursors.insert(contract_a_id.to_string(), token);
+    }
+
+    // Fetch for contract B
+    let url_b = format!(
+        "{}/accounts/{}/transactions?cursor=now&order=asc&limit=200",
+        horizon.uri(),
+        contract_b_id
+    );
+    let page_b: Page = client.get(&url_b).send().await.unwrap().json().await.unwrap();
+    if !page_b._embedded.records.is_empty() {
+        let token = page_b._embedded.records[0].paging_token.clone();
+        cursors.insert(contract_b_id.to_string(), token);
+    }
+
+    // Verify each contract's cursor is set to its own paging token
+    assert_eq!(cursors.get(contract_a_id).map(String::as_str), Some("token_a"));
+    assert_eq!(cursors.get(contract_b_id).map(String::as_str), Some("token_b"));
+}
