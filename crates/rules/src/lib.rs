@@ -319,6 +319,28 @@ mod tests {
     }
 
     #[test]
+    fn function_called_does_not_fire_when_function_name_is_none() {
+        let tx = make_tx(true, None, None);
+        let payloads = run(
+            &[AlertRule::FunctionCalled { function_name: "withdraw".into() }],
+            &tx,
+        );
+        assert!(payloads.is_empty());
+    }
+
+    #[test]
+    fn admin_function_called_does_not_fire_when_function_name_is_none() {
+        let tx = make_tx(true, None, None);
+        let payloads = run(
+            &[AlertRule::AdminFunctionCalled {
+                function_names: vec!["set_admin".into(), "upgrade".into()],
+            }],
+            &tx,
+        );
+        assert!(payloads.is_empty());
+    }
+
+    #[test]
     fn multiple_rules_can_fire_on_same_tx() {
         let tx = make_tx(false, Some("set_admin"), Some(200_000_000_000));
         let rules = vec![
