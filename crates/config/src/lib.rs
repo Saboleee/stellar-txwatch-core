@@ -288,6 +288,21 @@ mod tests {
     }
 
     #[test]
+    fn from_file_returns_error_for_invalid_toml() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("txwatch_invalid_{}.toml", std::process::id()));
+        std::fs::write(&path, "this is } not [ valid toml").unwrap();
+        let result = AppConfig::from_file(&path);
+        let path_str = path.display().to_string();
+        let _ = std::fs::remove_file(&path);
+        let err = result.expect_err("expected an error for invalid TOML");
+        assert!(
+            format!("{}", err).contains(&path_str),
+            "error message should reference the file path"
+        );
+    }
+
+    #[test]
     fn rejects_poll_interval_over_max() {
         let raw = r#"
             poll_interval_seconds = 9999
