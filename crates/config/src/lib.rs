@@ -121,6 +121,7 @@ pub struct WatchedContract {
     pub rules:       Vec<AlertRule>,
     pub webhook_url: String,
     /// Optional secret sent as X-TxWatch-Secret header on every webhook POST.
+    #[serde(default)]
     pub webhook_secret: Option<String>,
 }
 
@@ -301,5 +302,23 @@ mod tests {
         "#;
         let cfg: AppConfig = toml::from_str(raw).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn webhook_secret_defaults_to_none_when_absent() {
+        let raw = r#"
+            poll_interval_seconds = 10
+            [[contracts]]
+            label = "Test Contract"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[contracts.rules]]
+            type = "AnyTransaction"
+        "#;
+        let cfg: AppConfig = toml::from_str(raw).unwrap();
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.contracts.len(), 1);
+        assert_eq!(cfg.contracts[0].webhook_secret, None);
     }
 }
