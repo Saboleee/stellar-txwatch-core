@@ -74,27 +74,40 @@ async fn main() -> Result<()> {
                 println!(
                     "  [{network}] {label}",
                     network = c.network.display_name(),
-                    label   = c.label
+                    label = c.label
                 );
                 println!("    contract_id  : {}", c.contract_id);
                 println!("    webhook_url  : {}", c.webhook_url);
-                println!("    secret       : {}", if c.webhook_secret.is_some() { "set" } else { "none" });
+                println!(
+                    "    secret       : {}",
+                    if c.webhook_secret.is_some() {
+                        "set"
+                    } else {
+                        "none"
+                    }
+                );
                 println!("    rules        : {}", c.rules.len());
                 println!("    horizon      : {}", c.network.horizon_base_url());
-                println!("    explorer     : {}/contract/{}", c.network.explorer_base_url(), c.contract_id);
+                println!(
+                    "    explorer     : {}/contract/{}",
+                    c.network.explorer_base_url(),
+                    c.contract_id
+                );
             }
         }
 
         Command::TestWebhook { url, label } => {
             let cfg = AppConfig::from_file(&cli.config)?;
             if cfg.contracts.is_empty() {
-                return Err(anyhow::anyhow!("config has no contracts; cannot derive network for test-webhook"));
+                return Err(anyhow::anyhow!(
+                    "config has no contracts; cannot derive network for test-webhook"
+                ));
             }
             let first_contract = &cfg.contracts[0];
             let network_name = first_contract.network.as_str();
             let horizon_base_url = first_contract.network.horizon_base_url();
             let payload = test_payload_with_network(&label, &url, network_name, horizon_base_url);
-            let client  = Client::builder()
+            let client = Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .context("failed to build HTTP client")?;
@@ -109,9 +122,9 @@ async fn main() -> Result<()> {
         Command::Watch => {
             let cfg = AppConfig::from_file(&cli.config)?;
             info!(
-                version        = VERSION,
-                contracts      = cfg.contracts.len(),
-                interval_secs  = cfg.poll_interval_seconds,
+                version = VERSION,
+                contracts = cfg.contracts.len(),
+                interval_secs = cfg.poll_interval_seconds,
                 "starting TxWatch"
             );
             txwatch_poller::run(cfg).await?;

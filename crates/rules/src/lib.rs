@@ -42,8 +42,8 @@ pub struct EnrichedTransaction {
     pub timestamp: DateTime<Utc>,
     pub successful: bool,
     pub paging_token: String,
-    /// Soroban contract function that was invoked, if any.
-    pub function_name: Option<String>,
+    /// Soroban contract functions invoked in this transaction (one per invoke_host_function op).
+    pub function_names: Vec<String>,
     /// Transfer amount in stroops (1 XLM = 10_000_000 stroops), if detected.
     /// Uses u64 because the total XLM supply is ~50 billion XLM = ~500 trillion stroops,
     /// which is well within u64::MAX (18.4 quintillion). This type is sufficient for any
@@ -92,15 +92,21 @@ pub struct AlertPayload {
     pub label: String,
     pub contract_id: String,
     pub network: String,
+    pub rule_type: String,
     pub rule_triggered: String,
     pub transaction_hash: String,
+    /// First function name, for backward compatibility.
     pub function_name: Option<String>,
+    /// All function names invoked in this transaction.
+    pub function_names: Vec<String>,
     /// Amount in whole XLM (stroops / 10_000_000), present for LargeTransfer.
-    pub amount_xlm:       Option<u64>,
+    pub amount_xlm: Option<u64>,
     /// Fee charged in stroops.
     pub fee_charged_stroops: Option<u64>,
     /// Unix timestamp (seconds).
     pub timestamp: i64,
+    /// ISO 8601 timestamp string.
+    pub timestamp_iso: String,
     pub horizon_link: String,
     /// Stellar Expert explorer link for the transaction.
     pub explorer_link: String,
@@ -123,37 +129,36 @@ pub fn evaluate(
     let horizon_link = format!("{}/transactions/{}", horizon_base, tx.hash);
     let explorer_link = format!("{}/tx/{}", explorer_base, tx.hash);
     let timestamp = tx.timestamp.timestamp();
+    let timestamp_iso = tx.timestamp.to_rfc3339();
 
     rules
         .iter()
-        .filter_map(|rule| {
-            match eval_rule(rule, tx) {
-                Ok(true) => Some(AlertPayload {
-                    label:            label.to_string(),
-                    contract_id:      contract_id.to_string(),
-                    network:          network.to_string(),
-                    rule_type:        rule_type(rule),
-                    rule_triggered:   rule_label(rule),
-                    transaction_hash: tx.hash.clone(),
-                    function_name:    tx.function_names.first().cloned(),
-                    function_names:   tx.function_names.clone(),
-                    amount_xlm:       tx.amount_stroops.map(|s| s / 10_000_000),
-                    fee_charged_stroops: tx.fee_charged_stroops,
-                    timestamp,
-                    timestamp_iso:    timestamp_iso.clone(),
-                    horizon_link:     horizon_link.clone(),
-                    explorer_link:    explorer_link.clone(),
-                }),
-                Ok(false) => None,
-                Err(e) => {
-                    tracing::warn!(
-                        tx = %tx.hash,
-                        rule = %rule_label(rule),
-                        error = %e,
-                        "rule evaluation error — skipping"
-                    );
-                    None
-                }
+        .filter_map(|rule| match eval_rule(rule, tx) {
+            Ok(true) => Some(AlertPayload {
+                label: label.to_string(),
+                contract_id: contract_id.to_string(),
+                network: network.to_string(),
+                rule_type: rule_type(rule),
+                rule_triggered: rule_label(rule),
+                transaction_hash: tx.hash.clone(),
+                function_name: tx.function_names.first().cloned(),
+                function_names: tx.function_names.clone(),
+                amount_xlm: tx.amount_stroops.map(|s| s / 10_000_000),
+                fee_charged_stroops: tx.fee_charged_stroops,
+                timestamp,
+                timestamp_iso: timestamp_iso.clone(),
+                horizon_link: horizon_link.clone(),
+                explorer_link: explorer_link.clone(),
+            }),
+            Ok(false) => None,
+            Err(e) => {
+                tracing::warn!(
+                    tx = %tx.hash,
+                    rule = %rule_label(rule),
+                    error = %e,
+                    "rule evaluation error — skipping"
+                );
+                None
             }
         })
         .collect()
@@ -182,14 +187,10 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
             .iter()
             .any(|f| f == function_name.as_str()),
 
-        AlertRule::AdminFunctionCalled { function_names } => tx
-            .function_name
-            .as_deref()
-            .map(|f| {
-                let f_lower = f.to_lowercase();
-                function_names.iter().any(|n| n.to_lowercase() == f_lower)
-            })
-            .unwrap_or(false),
+        AlertRule::AdminFunctionCalled { function_names } => tx.function_names.iter().any(|f| {
+            let f_lower = f.to_lowercase();
+            function_names.iter().any(|n| n.to_lowercase() == f_lower)
+        }),
 
         AlertRule::HighFee { threshold_stroops } => tx
             .fee_charged_stroops
@@ -220,12 +221,12 @@ fn rule_label(rule: &AlertRule) -> String {
 
 fn rule_type(rule: &AlertRule) -> String {
     match rule {
-        AlertRule::AnyTransaction          => "AnyTransaction".into(),
-        AlertRule::TransactionFailed       => "TransactionFailed".into(),
-        AlertRule::LargeTransfer { .. }   => "LargeTransfer".into(),
-        AlertRule::FunctionCalled { .. }  => "FunctionCalled".into(),
+        AlertRule::AnyTransaction => "AnyTransaction".into(),
+        AlertRule::TransactionFailed => "TransactionFailed".into(),
+        AlertRule::LargeTransfer { .. } => "LargeTransfer".into(),
+        AlertRule::FunctionCalled { .. } => "FunctionCalled".into(),
         AlertRule::AdminFunctionCalled { .. } => "AdminFunctionCalled".into(),
-        AlertRule::HighFee { .. }         => "HighFee".into(),
+        AlertRule::HighFee { .. } => "HighFee".into(),
     }
 }
 
@@ -255,7 +256,7 @@ mod tests {
             timestamp: "2024-01-15T12:00:00Z".parse().unwrap(),
             successful,
             paging_token: "100".into(),
-            function_name: function_name.map(str::to_string),
+            function_names: function_names.iter().map(|s| s.to_string()).collect(),
             amount_stroops,
             fee_charged_stroops: None,
         }
@@ -283,7 +284,7 @@ mod tests {
 
     #[test]
     fn any_transaction_fires_on_failed_transaction() {
-        let tx = make_tx(false, None, None);
+        let tx = make_tx(false, &[], None);
         let payloads = run(&[AlertRule::AnyTransaction], &tx);
         assert_eq!(payloads.len(), 1);
         assert_eq!(payloads[0].rule_triggered, "AnyTransaction");
@@ -306,7 +307,7 @@ mod tests {
     #[test]
     fn large_transfer_fires_at_threshold() {
         // exactly 10_000 XLM = 100_000_000_000 stroops
-        let tx = make_tx(true, None, Some(100_000_000_000));
+        let tx = make_tx(true, &[], Some(100_000_000_000));
         let payloads = run(
             &[AlertRule::LargeTransfer {
                 threshold_xlm: 10_000,
@@ -319,7 +320,7 @@ mod tests {
 
     #[test]
     fn large_transfer_does_not_fire_below_threshold() {
-        let tx = make_tx(true, None, Some(9_999 * 10_000_000));
+        let tx = make_tx(true, &[], Some(9_999 * 10_000_000));
         let payloads = run(
             &[AlertRule::LargeTransfer {
                 threshold_xlm: 10_000,
@@ -338,16 +339,26 @@ mod tests {
 
     #[test]
     fn large_transfer_fires_at_exact_threshold() {
-        let tx = make_tx(true, None, Some(10_000 * 10_000_000));
-        let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: 10_000 }], &tx);
+        let tx = make_tx(true, &[], Some(10_000 * 10_000_000));
+        let payloads = run(
+            &[AlertRule::LargeTransfer {
+                threshold_xlm: 10_000,
+            }],
+            &tx,
+        );
         assert_eq!(payloads.len(), 1);
         assert_eq!(payloads[0].amount_xlm, Some(10_000));
     }
 
     #[test]
     fn large_transfer_does_not_fire_one_stroop_below_threshold() {
-        let tx = make_tx(true, None, Some(10_000 * 10_000_000 - 1));
-        let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: 10_000 }], &tx);
+        let tx = make_tx(true, &[], Some(10_000 * 10_000_000 - 1));
+        let payloads = run(
+            &[AlertRule::LargeTransfer {
+                threshold_xlm: 10_000,
+            }],
+            &tx,
+        );
         assert!(payloads.is_empty());
     }
 
@@ -391,9 +402,11 @@ mod tests {
 
     #[test]
     fn function_called_does_not_fire_when_function_name_is_none() {
-        let tx = make_tx(true, None, None);
+        let tx = make_tx(true, &[], None);
         let payloads = run(
-            &[AlertRule::FunctionCalled { function_name: "withdraw".into() }],
+            &[AlertRule::FunctionCalled {
+                function_name: "withdraw".into(),
+            }],
             &tx,
         );
         assert!(payloads.is_empty());
@@ -401,7 +414,7 @@ mod tests {
 
     #[test]
     fn admin_function_called_does_not_fire_when_function_name_is_none() {
-        let tx = make_tx(true, None, None);
+        let tx = make_tx(true, &[], None);
         let payloads = run(
             &[AlertRule::AdminFunctionCalled {
                 function_names: vec!["set_admin".into(), "upgrade".into()],
@@ -467,7 +480,7 @@ mod tests {
 
     #[test]
     fn high_fee_no_fee_does_not_fire() {
-        let tx = make_tx(true, None, None);
+        let tx = make_tx(true, &[], None);
         let payloads = run(
             &[AlertRule::HighFee {
                 threshold_stroops: 1,
@@ -499,7 +512,9 @@ mod tests {
         // Transaction has two Soroban invocations; rule should match the second
         let tx = make_tx(true, &["deposit", "withdraw"], None);
         let payloads = run(
-            &[AlertRule::FunctionCalled { function_name: "withdraw".into() }],
+            &[AlertRule::FunctionCalled {
+                function_name: "withdraw".into(),
+            }],
             &tx,
         );
         assert_eq!(payloads.len(), 1);
@@ -510,7 +525,9 @@ mod tests {
     fn function_called_does_not_fire_when_no_names_match() {
         let tx = make_tx(true, &["deposit", "transfer"], None);
         let payloads = run(
-            &[AlertRule::FunctionCalled { function_name: "withdraw".into() }],
+            &[AlertRule::FunctionCalled {
+                function_name: "withdraw".into(),
+            }],
             &tx,
         );
         assert!(payloads.is_empty());

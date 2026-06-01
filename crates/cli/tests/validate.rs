@@ -1,8 +1,4 @@
-use std::{
-    env,
-    fs,
-    process::Command,
-};
+use std::{env, fs, process::Command};
 
 fn txwatch_bin() -> Command {
     // `cargo test` sets CARGO_BIN_EXE_txwatch when the binary is declared in the same workspace.
@@ -48,5 +44,9 @@ fn validate_exits_one_for_invalid_config() {
         .status()
         .expect("failed to run txwatch");
 
-    assert_eq!(status.code(), Some(1), "expected exit code 1 for invalid config");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "expected exit code 1 for invalid config"
+    );
 }

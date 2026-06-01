@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{anyhow, Result};
+use chrono::Utc;
 use reqwest::Client;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
@@ -84,6 +85,34 @@ pub async fn send_webhook(
     Err(err)
 }
 
+/// Build a synthetic `AlertPayload` suitable for `test-webhook` using network-specific URLs.
+pub fn test_payload_with_network(
+    label: &str,
+    webhook_url: &str,
+    network: &str,
+    horizon_base_url: &str,
+) -> AlertPayload {
+    let now = Utc::now();
+    let hash = "0000000000000000000000000000000000000000000000000000000000000000";
+    AlertPayload {
+        label: label.to_string(),
+        contract_id: "CTEST000000000000000000000000000000000000000000000000000".into(),
+        network: network.to_string(),
+        rule_type: "TestWebhook".into(),
+        rule_triggered: "TestWebhook".into(),
+        transaction_hash: hash.into(),
+        function_name: Some("test".into()),
+        function_names: vec!["test".into()],
+        amount_xlm: None,
+        fee_charged_stroops: None,
+        timestamp: now.timestamp(),
+        timestamp_iso: now.to_rfc3339(),
+        horizon_link: format!("{}/transactions/{}", horizon_base_url, hash),
+        explorer_link: format!("https://stellar.expert/explorer/{}/tx/{}", network, hash),
+    }
+    .with_label(format!("{} (test-webhook to {})", label, webhook_url))
+}
+
 /// Build a synthetic `AlertPayload` suitable for `test-webhook`.
 /// Uses the provided network name and horizon base URL, falling back to testnet defaults if not provided.
 pub fn test_payload(label: &str, webhook_url: &str) -> AlertPayload {
@@ -96,9 +125,11 @@ pub fn test_payload(label: &str, webhook_url: &str) -> AlertPayload {
         rule_triggered:   "TestWebhook".into(),
         transaction_hash: "0000000000000000000000000000000000000000000000000000000000000000".into(),
         function_name:    Some("test".into()),
+        function_names:   vec!["test".into()],
         amount_xlm:       None,
         fee_charged_stroops: None,
-        timestamp:        Utc::now().timestamp(),
+        timestamp:        now.timestamp(),
+        timestamp_iso:    now.to_rfc3339(),
         horizon_link: "https://horizon-testnet.stellar.org/transactions/0000000000000000000000000000000000000000000000000000000000000000".into(),
         explorer_link:    "https://stellar.expert/explorer/testnet/tx/0000000000000000000000000000000000000000000000000000000000000000".into(),
     }
@@ -120,15 +151,17 @@ mod tests {
             label: "Test Contract".into(),
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
             network: "testnet".into(),
+            rule_type: "AnyTransaction".into(),
             rule_triggered: "AnyTransaction".into(),
             transaction_hash: "abc123".into(),
-            function_name:    None,
-            amount_xlm:       None,
+            function_name: None,
+            function_names: vec![],
+            amount_xlm: None,
             fee_charged_stroops: None,
-            timestamp:        1_700_000_000,
-            timestamp_iso:    "2023-11-15T03:13:20Z".into(),
-            horizon_link:     "https://horizon-testnet.stellar.org/transactions/abc123".into(),
-            explorer_link:    "https://stellar.expert/explorer/testnet/tx/abc123".into(),
+            timestamp: 1_700_000_000,
+            timestamp_iso: "2023-11-15T03:13:20Z".into(),
+            horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),
+            explorer_link: "https://stellar.expert/explorer/testnet/tx/abc123".into(),
         }
     }
 
@@ -181,7 +214,9 @@ mod tests {
 
         let client = Client::new();
         let url = format!("{}/hook", server.uri());
-        send_webhook(&client, &url, &sample_payload(), Some("mysecret")).await.unwrap();
+        send_webhook(&client, &url, &sample_payload(), Some("mysecret"))
+            .await
+            .unwrap();
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
@@ -206,7 +241,9 @@ mod tests {
 
         let client = Client::new();
         let url = format!("{}/hook", server.uri());
-        send_webhook(&client, &url, &sample_payload(), None).await.unwrap();
+        send_webhook(&client, &url, &sample_payload(), None)
+            .await
+            .unwrap();
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);

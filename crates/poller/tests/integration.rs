@@ -24,15 +24,14 @@ use txwatch_rules::{evaluate, EnrichedTransaction};
 /// returned on the first poll cycle, then gets empty pages on subsequent cycles.
 #[tokio::test]
 async fn run_polls_once_and_fires_webhook() {
-    let horizon  = MockServer::start().await;
+    let horizon = MockServer::start().await;
     let receiver = MockServer::start().await;
 
     // First transactions request returns one tx.
     Mock::given(method("GET"))
         .and(path_regex("/accounts/.*/transactions"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(helpers::tx_page("run001", "500", true)),
+            ResponseTemplate::new(200).set_body_json(helpers::tx_page("run001", "500", true)),
         )
         .up_to_n_times(1)
         .mount(&horizon)
@@ -41,18 +40,14 @@ async fn run_polls_once_and_fires_webhook() {
     // All subsequent transaction requests return an empty page.
     Mock::given(method("GET"))
         .and(path_regex("/accounts/.*/transactions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(helpers::empty_page()),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
         .mount(&horizon)
         .await;
 
     // Operations for the tx: no Soroban details needed.
     Mock::given(method("GET"))
         .and(path("/transactions/run001/operations"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(helpers::empty_page()),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
         .mount(&horizon)
         .await;
 
@@ -73,6 +68,9 @@ async fn run_polls_once_and_fires_webhook() {
     let cfg = AppConfig {
         poll_interval_seconds: 1,
         contracts: vec![contract],
+        http_pool_max_idle_per_host: None,
+        http_tcp_keepalive_secs: None,
+        http_connection_verbose: None,
     };
 
     // Drive the loop for one full poll cycle (slightly more than the interval).
@@ -84,23 +82,20 @@ async fn run_polls_once_and_fires_webhook() {
 /// AnyTransaction rule fires and webhook is called exactly once.
 #[tokio::test]
 async fn any_transaction_fires_webhook() {
-    let horizon  = MockServer::start().await;
+    let horizon = MockServer::start().await;
     let receiver = MockServer::start().await;
 
     Mock::given(method("GET"))
         .and(path_regex("/accounts/.*/transactions"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(helpers::tx_page("hash001", "100", true)),
+            ResponseTemplate::new(200).set_body_json(helpers::tx_page("hash001", "100", true)),
         )
         .mount(&horizon)
         .await;
 
     Mock::given(method("GET"))
         .and(path("/transactions/hash001/operations"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(helpers::empty_page()),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
         .mount(&horizon)
         .await;
 
@@ -111,7 +106,7 @@ async fn any_transaction_fires_webhook() {
         .mount(&receiver)
         .await;
 
-    let client   = Client::new();
+    let client = Client::new();
     let contract = helpers::contract(
         &format!("{}/hook", receiver.uri()),
         vec![AlertRule::AnyTransaction],
@@ -124,9 +119,13 @@ async fn any_transaction_fires_webhook() {
     );
 
     #[derive(serde::Deserialize)]
-    struct Page { _embedded: Emb }
+    struct Page {
+        _embedded: Emb,
+    }
     #[derive(serde::Deserialize)]
-    struct Emb  { records: Vec<txwatch_rules::HorizonTransaction> }
+    struct Emb {
+        records: Vec<txwatch_rules::HorizonTransaction>,
+    }
 
     let page: Page = client.get(&url).send().await.unwrap().json().await.unwrap();
     let records = page._embedded.records;
@@ -135,7 +134,14 @@ async fn any_transaction_fires_webhook() {
     for raw in records {
         let ops_url = format!("{}/transactions/{}/operations", horizon.uri(), raw.hash);
         // Consume the operations response to satisfy the mock expectation.
-        let _ = client.get(&ops_url).send().await.unwrap().bytes().await.unwrap();
+        let _ = client
+            .get(&ops_url)
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
 
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         let payloads = evaluate(
@@ -160,7 +166,7 @@ async fn any_transaction_fires_webhook() {
 /// TransactionFailed rule fires only for failed transactions.
 #[tokio::test]
 async fn transaction_failed_rule_fires_only_on_failure() {
-    let horizon  = MockServer::start().await;
+    let horizon = MockServer::start().await;
     let receiver = MockServer::start().await;
 
     Mock::given(method("GET"))
@@ -191,7 +197,7 @@ async fn transaction_failed_rule_fires_only_on_failure() {
         .mount(&receiver)
         .await;
 
-    let client   = Client::new();
+    let client = Client::new();
     let contract = helpers::contract(
         &format!("{}/hook", receiver.uri()),
         vec![AlertRule::TransactionFailed],
@@ -200,32 +206,50 @@ async fn transaction_failed_rule_fires_only_on_failure() {
     let txs = vec![
         EnrichedTransaction::from_horizon(
             txwatch_rules::HorizonTransaction {
-                hash: "ok_tx".into(), created_at: "2024-06-01T10:00:00Z".into(),
-                successful: true, paging_token: "1".into(),
-                fee_charged: None, envelope_xdr: None, result_xdr: None,
+                hash: "ok_tx".into(),
+                created_at: "2024-06-01T10:00:00Z".into(),
+                successful: true,
+                paging_token: "1".into(),
+                fee_charged: None,
+                envelope_xdr: None,
+                result_xdr: None,
             },
-            vec![], None, None,
-        ).unwrap(),
+            vec![],
+            None,
+            None,
+        )
+        .unwrap(),
         EnrichedTransaction::from_horizon(
             txwatch_rules::HorizonTransaction {
-                hash: "fail_tx".into(), created_at: "2024-06-01T10:01:00Z".into(),
-                successful: false, paging_token: "2".into(),
-                fee_charged: None, envelope_xdr: None, result_xdr: None,
+                hash: "fail_tx".into(),
+                created_at: "2024-06-01T10:01:00Z".into(),
+                successful: false,
+                paging_token: "2".into(),
+                fee_charged: None,
+                envelope_xdr: None,
+                result_xdr: None,
             },
-            vec![], None, None,
-        ).unwrap(),
+            vec![],
+            None,
+            None,
+        )
+        .unwrap(),
     ];
 
     for tx in &txs {
         let payloads = evaluate(
-            &contract.label, &contract.contract_id,
-            contract.network.as_str(), &horizon.uri(),
+            &contract.label,
+            &contract.contract_id,
+            contract.network.as_str(),
+            &horizon.uri(),
             "https://stellar.expert/explorer/testnet",
-            &contract.rules, tx,
+            &contract.rules,
+            tx,
         );
         for p in &payloads {
             txwatch_notifier::send_webhook(&client, &contract.webhook_url, p, None)
-                .await.unwrap();
+                .await
+                .unwrap();
         }
     }
 }
@@ -241,34 +265,45 @@ async fn large_transfer_fires_above_threshold() {
         .mount(&receiver)
         .await;
 
-    let client   = Client::new();
+    let client = Client::new();
     let contract = helpers::contract(
         &format!("{}/hook", receiver.uri()),
-        vec![AlertRule::LargeTransfer { threshold_xlm: 5_000 }],
+        vec![AlertRule::LargeTransfer {
+            threshold_xlm: 5_000,
+        }],
     );
 
     let tx = EnrichedTransaction::from_horizon(
         txwatch_rules::HorizonTransaction {
-            hash: "big_tx".into(), created_at: "2024-06-01T10:00:00Z".into(),
-            successful: true, paging_token: "1".into(),
-            fee_charged: None, envelope_xdr: None, result_xdr: None,
+            hash: "big_tx".into(),
+            created_at: "2024-06-01T10:00:00Z".into(),
+            successful: true,
+            paging_token: "1".into(),
+            fee_charged: None,
+            envelope_xdr: None,
+            result_xdr: None,
         },
         vec![],
         Some(100_000_000_000),
         None,
-    ).unwrap();
+    )
+    .unwrap();
 
     let payloads = evaluate(
-        &contract.label, &contract.contract_id,
-        contract.network.as_str(), "https://horizon-testnet.stellar.org",
+        &contract.label,
+        &contract.contract_id,
+        contract.network.as_str(),
+        "https://horizon-testnet.stellar.org",
         "https://stellar.expert/explorer/testnet",
-        &contract.rules, &tx,
+        &contract.rules,
+        &tx,
     );
     assert_eq!(payloads.len(), 1);
     assert_eq!(payloads[0].amount_xlm, Some(10_000));
 
     txwatch_notifier::send_webhook(&client, &contract.webhook_url, &payloads[0], None)
-        .await.unwrap();
+        .await
+        .unwrap();
 }
 
 /// FunctionCalled rule fires only when the function name matches.
@@ -282,41 +317,61 @@ async fn function_called_rule_fires_on_exact_match() {
         .mount(&receiver)
         .await;
 
-    let client   = Client::new();
+    let client = Client::new();
     let contract = helpers::contract(
         &format!("{}/hook", receiver.uri()),
-        vec![AlertRule::FunctionCalled { function_name: "withdraw".into() }],
+        vec![AlertRule::FunctionCalled {
+            function_name: "withdraw".into(),
+        }],
     );
 
     let txs = vec![
         EnrichedTransaction::from_horizon(
             txwatch_rules::HorizonTransaction {
-                hash: "t1".into(), created_at: "2024-06-01T10:00:00Z".into(),
-                successful: true, paging_token: "1".into(),
-                fee_charged: None, envelope_xdr: None, result_xdr: None,
+                hash: "t1".into(),
+                created_at: "2024-06-01T10:00:00Z".into(),
+                successful: true,
+                paging_token: "1".into(),
+                fee_charged: None,
+                envelope_xdr: None,
+                result_xdr: None,
             },
-            vec!["deposit".into()], None, None,
-        ).unwrap(),
+            vec!["deposit".into()],
+            None,
+            None,
+        )
+        .unwrap(),
         EnrichedTransaction::from_horizon(
             txwatch_rules::HorizonTransaction {
-                hash: "t2".into(), created_at: "2024-06-01T10:01:00Z".into(),
-                successful: true, paging_token: "2".into(),
-                fee_charged: None, envelope_xdr: None, result_xdr: None,
+                hash: "t2".into(),
+                created_at: "2024-06-01T10:01:00Z".into(),
+                successful: true,
+                paging_token: "2".into(),
+                fee_charged: None,
+                envelope_xdr: None,
+                result_xdr: None,
             },
-            vec!["withdraw".into()], None, None,
-        ).unwrap(),
+            vec!["withdraw".into()],
+            None,
+            None,
+        )
+        .unwrap(),
     ];
 
     for tx in &txs {
         let payloads = evaluate(
-            &contract.label, &contract.contract_id,
-            contract.network.as_str(), "https://horizon-testnet.stellar.org",
+            &contract.label,
+            &contract.contract_id,
+            contract.network.as_str(),
+            "https://horizon-testnet.stellar.org",
             "https://stellar.expert/explorer/testnet",
-            &contract.rules, tx,
+            &contract.rules,
+            tx,
         );
         for p in &payloads {
             txwatch_notifier::send_webhook(&client, &contract.webhook_url, p, None)
-                .await.unwrap();
+                .await
+                .unwrap();
         }
     }
 }
@@ -340,37 +395,32 @@ async fn cursor_advances_after_each_transaction() {
 /// HighFee rule fires when fee_charged from Horizon response exceeds threshold.
 #[tokio::test]
 async fn high_fee_rule_fires_on_fee_charged() {
-    let horizon  = MockServer::start().await;
+    let horizon = MockServer::start().await;
     let receiver = MockServer::start().await;
 
     // Horizon: transaction with fee_charged: "50000" (stroops)
     Mock::given(method("GET"))
         .and(path_regex("/accounts/.*/transactions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({
-                    "_embedded": {
-                        "records": [{
-                            "hash":         "fee_tx",
-                            "created_at":   "2024-06-01T10:00:00Z",
-                            "successful":   true,
-                            "paging_token": "1",
-                            "fee_charged":  "50000",
-                            "envelope_xdr": null,
-                            "result_xdr":   null
-                        }]
-                    }
-                })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "_embedded": {
+                "records": [{
+                    "hash":         "fee_tx",
+                    "created_at":   "2024-06-01T10:00:00Z",
+                    "successful":   true,
+                    "paging_token": "1",
+                    "fee_charged":  "50000",
+                    "envelope_xdr": null,
+                    "result_xdr":   null
+                }]
+            }
+        })))
         .mount(&horizon)
         .await;
 
     // Horizon: operations for that transaction (empty, no Soroban)
     Mock::given(method("GET"))
         .and(path("/transactions/fee_tx/operations"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(empty_page_json()),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
         .mount(&horizon)
         .await;
 
@@ -382,10 +432,12 @@ async fn high_fee_rule_fires_on_fee_charged() {
         .mount(&receiver)
         .await;
 
-    let client   = Client::new();
-    let contract = contract(
+    let client = Client::new();
+    let contract = helpers::contract(
         &format!("{}/hook", receiver.uri()),
-        vec![AlertRule::HighFee { threshold_stroops: 10_000 }],
+        vec![AlertRule::HighFee {
+            threshold_stroops: 10_000,
+        }],
     );
 
     let tx = EnrichedTransaction::from_horizon(
@@ -398,10 +450,11 @@ async fn high_fee_rule_fires_on_fee_charged() {
             envelope_xdr: None,
             result_xdr: None,
         },
+        vec![],
         None,
         None,
-        None,
-    ).unwrap();
+    )
+    .unwrap();
 
     let payloads = evaluate(
         &contract.label,
@@ -419,4 +472,64 @@ async fn high_fee_rule_fires_on_fee_charged() {
     txwatch_notifier::send_webhook(&client, &contract.webhook_url, &payloads[0], None)
         .await
         .unwrap();
+}
+
+/// poll_contract fires AnyTransaction rule exactly once per transaction on a page.
+/// A Horizon page with 3 transactions and an AnyTransaction rule must produce
+/// exactly 3 webhook POST requests — one per transaction. Closes #121.
+#[tokio::test]
+async fn poll_contract_fires_any_transaction_rule_per_transaction() {
+    let horizon = MockServer::start().await;
+    let receiver = MockServer::start().await;
+
+    // First transactions request returns a page with 3 transactions.
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(helpers::tx_page_3("tx001", "tx002", "tx003")),
+        )
+        .up_to_n_times(1)
+        .mount(&horizon)
+        .await;
+
+    // Subsequent requests return an empty page (loop termination).
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+
+    // Operations endpoint returns empty for all transactions.
+    Mock::given(method("GET"))
+        .and(path_regex("/transactions/.*/operations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+
+    // Webhook receiver must receive exactly 3 POST requests.
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(3)
+        .mount(&receiver)
+        .await;
+
+    let mut contract = helpers::contract(
+        &format!("{}/hook", receiver.uri()),
+        vec![AlertRule::AnyTransaction],
+    );
+    contract.horizon_base_url_override = Some(horizon.uri());
+
+    let cfg = AppConfig {
+        poll_interval_seconds: 1,
+        contracts: vec![contract],
+        http_pool_max_idle_per_host: None,
+        http_tcp_keepalive_secs: None,
+        http_connection_verbose: None,
+    };
+
+    // Drive one full poll cycle (transaction page) then allow the empty-page cycle.
+    let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
+
+    // MockServer drop asserts exactly 3 webhooks received.
 }
