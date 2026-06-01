@@ -348,4 +348,13 @@ mod tests {
         let cfg: AppConfig = toml::from_str(raw).unwrap();
         assert!(cfg.validate().is_err());
     }
+
+    #[test]
+    fn from_file_returns_err_for_missing_file() {
+        let nonexistent_path = std::path::Path::new("/tmp/txwatch_nonexistent_test_config.toml");
+        let result = AppConfig::from_file(nonexistent_path);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("txwatch_nonexistent_test_config.toml"));
+    }
 }
