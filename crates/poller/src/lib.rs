@@ -258,6 +258,15 @@ async fn poll_contract(
         }
     }
 
+    if tx_count > 0 {
+        info!(
+            contract     = %contract.label,
+            transactions = tx_count,
+            alerts       = alert_count,
+            "poll cycle complete"
+        );
+    }
+
     Ok((tx_count, alert_count))
 }
 
