@@ -607,3 +607,89 @@ async fn horizon_link_uses_canonical_url_not_mock_server() {
         horizon_link
     );
 }
+
+/// Two contracts polled concurrently: total wall time must be less than
+/// the sum of each contract's individual response delay, proving that a
+/// slow Horizon response for contract A does not delay contract B. Closes #36.
+#[tokio::test]
+async fn contracts_polled_concurrently() {
+    const DELAY_MS: u64 = 300;
+
+    let horizon1 = MockServer::start().await;
+    let horizon2 = MockServer::start().await;
+    let receiver = MockServer::start().await;
+
+    for horizon in [&horizon1, &horizon2] {
+        // Each Horizon server returns one tx with an artificial delay.
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(helpers::tx_page("delayed_tx", "1", true))
+                    .set_delay(Duration::from_millis(DELAY_MS)),
+            )
+            .up_to_n_times(1)
+            .mount(horizon)
+            .await;
+
+        // Subsequent requests return empty immediately.
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+            .mount(horizon)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex("/transactions/.*/operations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+            .mount(horizon)
+            .await;
+    }
+
+    // Expect exactly 2 webhook POSTs — one per contract.
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&receiver)
+        .await;
+
+    let make_contract = |label: &str, horizon_uri: &str| {
+        let mut c = helpers::contract(
+            &format!("{}/hook", receiver.uri()),
+            vec![AlertRule::AnyTransaction],
+        );
+        c.label = label.to_string();
+        c.contract_id = if label == "A" {
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()
+        } else {
+            "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string()
+        };
+        c.horizon_base_url_override = Some(horizon_uri.to_string());
+        c
+    };
+
+    let cfg = AppConfig {
+        poll_interval_seconds: 1,
+        contracts: vec![
+            make_contract("A", &horizon1.uri()),
+            make_contract("B", &horizon2.uri()),
+        ],
+        http_pool_max_idle_per_host: None,
+        http_tcp_keepalive_secs: None,
+        http_connection_verbose: None,
+    };
+
+    let start = std::time::Instant::now();
+    let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
+    let elapsed = start.elapsed();
+
+    // Sequential polling would take ≥ 2 × DELAY_MS. Concurrent polling takes ≈ DELAY_MS.
+    // We allow generous headroom (1.8×) to avoid flakiness on slow CI.
+    assert!(
+        elapsed < Duration::from_millis(DELAY_MS * 18 / 10 + 300),
+        "contracts should be polled concurrently; elapsed {:?} ≥ {:.0}ms",
+        elapsed,
+        DELAY_MS as f64 * 1.8 + 300.0,
+    );
+}

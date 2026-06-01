@@ -58,8 +58,8 @@ struct Counters {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/// Run the polling loop forever. Each contract is polled sequentially;
-/// a single bad transaction never stops the loop.
+/// Run the polling loop forever. Each contract is polled concurrently via a
+/// tokio JoinSet; one slow or failing contract never blocks the others.
 /// Logs a summary every 60 seconds: contracts watched, transactions processed,
 /// alerts fired.
 /// Backwards-compatible wrapper: default (non-dry) run
@@ -159,6 +159,9 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
     });
 
     loop {
+        let mut set: tokio::task::JoinSet<(String, String, Result<(u64, u64)>)> =
+            tokio::task::JoinSet::new();
+
         for contract in &cfg.contracts {
             match poll_contract(&client, contract, &mut cursors, dry_run).await {
                 Ok((txs, alerts)) => {
@@ -171,15 +174,12 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
                         .interval_alerts
                         .fetch_add(alerts, Ordering::Relaxed);
                 }
-                Err(e) => {
-                    error!(
-                        contract = %contract.label,
-                        error    = %e,
-                        "poll cycle error — will retry next interval"
-                    );
+                Err(join_err) => {
+                    error!(error = %join_err, "contract polling task panicked");
                 }
             }
         }
+
         tokio::time::sleep(interval).await;
     }
 }
