@@ -8,16 +8,16 @@ use txwatch_config::AlertRule;
 /// Raw Horizon transaction record as returned by the REST API.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HorizonTransaction {
-    pub hash:         String,
-    pub created_at:   String,   // RFC 3339
-    pub successful:   bool,
+    pub hash: String,
+    pub created_at: String, // RFC 3339
+    pub successful: bool,
     pub paging_token: String,
     /// Fee charged in stroops (Horizon returns this as a string).
-    pub fee_charged:  Option<String>,
+    pub fee_charged: Option<String>,
     /// Base64-encoded XDR transaction envelope.
     pub envelope_xdr: Option<String>,
     /// Base64-encoded XDR transaction result.
-    pub result_xdr:   Option<String>,
+    pub result_xdr: Option<String>,
 }
 
 // ── Enriched transaction ──────────────────────────────────────────────────────
@@ -28,10 +28,10 @@ pub struct HorizonTransaction {
 /// stays pure and testable without network calls.
 #[derive(Debug, Clone)]
 pub struct EnrichedTransaction {
-    pub hash:          String,
-    pub timestamp:     DateTime<Utc>,
-    pub successful:    bool,
-    pub paging_token:  String,
+    pub hash: String,
+    pub timestamp: DateTime<Utc>,
+    pub successful: bool,
+    pub paging_token: String,
     /// Soroban contract function that was invoked, if any.
     pub function_name: Option<String>,
     /// Transfer amount in stroops (1 XLM = 10_000_000 stroops), if detected.
@@ -48,12 +48,12 @@ impl EnrichedTransaction {
         amount_stroops: Option<u64>,
         fee_charged_stroops: Option<u64>,
     ) -> Result<Self> {
-        let timestamp = tx
-            .created_at
-            .parse::<DateTime<Utc>>()
-            .with_context(|| {
-                format!("cannot parse timestamp '{}' for tx {}", tx.created_at, tx.hash)
-            })?;
+        let timestamp = tx.created_at.parse::<DateTime<Utc>>().with_context(|| {
+            format!(
+                "cannot parse timestamp '{}' for tx {}",
+                tx.created_at, tx.hash
+            )
+        })?;
 
         Ok(Self {
             hash: tx.hash,
@@ -76,24 +76,21 @@ impl EnrichedTransaction {
 /// The JSON body POSTed to the webhook URL when a rule fires.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AlertPayload {
-    pub label:            String,
-    pub contract_id:      String,
-    pub network:          String,
-    /// Stable machine-readable rule variant name (e.g. "LargeTransfer", "HighFee").
-    pub rule_type:        String,
-    /// Human-readable rule description with parameters (e.g. "LargeTransfer(>=10000XLM)").
-    pub rule_triggered:   String,
+    pub label: String,
+    pub contract_id: String,
+    pub network: String,
+    pub rule_triggered: String,
     pub transaction_hash: String,
-    pub function_name:    Option<String>,
+    pub function_name: Option<String>,
     /// Amount in whole XLM (stroops / 10_000_000), present for LargeTransfer.
     pub amount_xlm:       Option<u64>,
+    /// Fee charged in stroops.
+    pub fee_charged_stroops: Option<u64>,
     /// Unix timestamp (seconds).
-    pub timestamp:        i64,
-    /// ISO 8601 timestamp string.
-    pub timestamp_iso:    String,
-    pub horizon_link:     String,
+    pub timestamp: i64,
+    pub horizon_link: String,
     /// Stellar Expert explorer link for the transaction.
-    pub explorer_link:    String,
+    pub explorer_link: String,
 }
 
 // ── Rule evaluation ───────────────────────────────────────────────────────────
@@ -102,18 +99,17 @@ pub struct AlertPayload {
 /// Returns one `AlertPayload` per matching rule.
 /// Never panics — errors in individual rule evaluation are logged and skipped.
 pub fn evaluate(
-    label:         &str,
-    contract_id:   &str,
-    network:       &str,
-    horizon_base:  &str,
+    label: &str,
+    contract_id: &str,
+    network: &str,
+    horizon_base: &str,
     explorer_base: &str,
-    rules:         &[AlertRule],
-    tx:            &EnrichedTransaction,
+    rules: &[AlertRule],
+    tx: &EnrichedTransaction,
 ) -> Vec<AlertPayload> {
-    let horizon_link  = format!("{}/transactions/{}", horizon_base, tx.hash);
+    let horizon_link = format!("{}/transactions/{}", horizon_base, tx.hash);
     let explorer_link = format!("{}/tx/{}", explorer_base, tx.hash);
-    let timestamp     = tx.timestamp.timestamp();
-    let timestamp_iso = tx.timestamp.to_rfc3339();
+    let timestamp = tx.timestamp.timestamp();
 
     rules
         .iter()
@@ -128,6 +124,7 @@ pub fn evaluate(
                     transaction_hash: tx.hash.clone(),
                     function_name:    tx.function_name.clone(),
                     amount_xlm:       tx.amount_stroops.map(|s| s / 10_000_000),
+                    fee_charged_stroops: tx.fee_charged_stroops,
                     timestamp,
                     timestamp_iso:    timestamp_iso.clone(),
                     horizon_link:     horizon_link.clone(),
@@ -184,14 +181,18 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
 
 fn rule_label(rule: &AlertRule) -> String {
     match rule {
-        AlertRule::AnyTransaction                          => "AnyTransaction".into(),
-        AlertRule::TransactionFailed                       => "TransactionFailed".into(),
-        AlertRule::LargeTransfer { threshold_xlm }        => format!("LargeTransfer(>={}XLM)", threshold_xlm),
-        AlertRule::FunctionCalled { function_name }       => format!("FunctionCalled({})", function_name),
+        AlertRule::AnyTransaction => "AnyTransaction".into(),
+        AlertRule::TransactionFailed => "TransactionFailed".into(),
+        AlertRule::LargeTransfer { threshold_xlm } => {
+            format!("LargeTransfer(>={}XLM)", threshold_xlm)
+        }
+        AlertRule::FunctionCalled { function_name } => format!("FunctionCalled({})", function_name),
         AlertRule::AdminFunctionCalled { function_names } => {
             format!("AdminFunctionCalled([{}])", function_names.join(", "))
         }
-        AlertRule::HighFee { threshold_stroops } => format!("HighFee(>={} stroops)", threshold_stroops),
+        AlertRule::HighFee { threshold_stroops } => {
+            format!("HighFee(>={} stroops)", threshold_stroops)
+        }
     }
 }
 
@@ -219,6 +220,7 @@ impl AlertPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Datelike;
     use txwatch_config::AlertRule;
 
     fn make_tx(
@@ -227,20 +229,26 @@ mod tests {
         amount_stroops: Option<u64>,
     ) -> EnrichedTransaction {
         EnrichedTransaction {
-            hash:                "abc123".into(),
-            timestamp:           "2024-01-15T12:00:00Z".parse().unwrap(),
+            hash: "abc123".into(),
+            timestamp: "2024-01-15T12:00:00Z".parse().unwrap(),
             successful,
-            paging_token:        "100".into(),
-            function_name:       function_name.map(str::to_string),
+            paging_token: "100".into(),
+            function_name: function_name.map(str::to_string),
             amount_stroops,
             fee_charged_stroops: None,
         }
     }
 
     fn run(rules: &[AlertRule], tx: &EnrichedTransaction) -> Vec<AlertPayload> {
-        evaluate("Label", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                 "testnet", "https://horizon-testnet.stellar.org",
-                 "https://stellar.expert/explorer/testnet", rules, tx)
+        evaluate(
+            "Label",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "testnet",
+            "https://horizon-testnet.stellar.org",
+            "https://stellar.expert/explorer/testnet",
+            rules,
+            tx,
+        )
     }
 
     #[test]
@@ -269,7 +277,12 @@ mod tests {
     fn large_transfer_fires_at_threshold() {
         // exactly 10_000 XLM = 100_000_000_000 stroops
         let tx = make_tx(true, None, Some(100_000_000_000));
-        let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: 10_000 }], &tx);
+        let payloads = run(
+            &[AlertRule::LargeTransfer {
+                threshold_xlm: 10_000,
+            }],
+            &tx,
+        );
         assert_eq!(payloads.len(), 1);
         assert_eq!(payloads[0].amount_xlm, Some(10_000));
     }
@@ -277,7 +290,12 @@ mod tests {
     #[test]
     fn large_transfer_does_not_fire_below_threshold() {
         let tx = make_tx(true, None, Some(9_999 * 10_000_000));
-        let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: 10_000 }], &tx);
+        let payloads = run(
+            &[AlertRule::LargeTransfer {
+                threshold_xlm: 10_000,
+            }],
+            &tx,
+        );
         assert!(payloads.is_empty());
     }
 
@@ -292,7 +310,9 @@ mod tests {
     fn function_called_fires_on_match() {
         let tx = make_tx(true, Some("withdraw"), None);
         let payloads = run(
-            &[AlertRule::FunctionCalled { function_name: "withdraw".into() }],
+            &[AlertRule::FunctionCalled {
+                function_name: "withdraw".into(),
+            }],
             &tx,
         );
         assert_eq!(payloads.len(), 1);
@@ -303,7 +323,9 @@ mod tests {
     fn function_called_does_not_fire_on_mismatch() {
         let tx = make_tx(true, Some("deposit"), None);
         let payloads = run(
-            &[AlertRule::FunctionCalled { function_name: "withdraw".into() }],
+            &[AlertRule::FunctionCalled {
+                function_name: "withdraw".into(),
+            }],
             &tx,
         );
         assert!(payloads.is_empty());
@@ -328,7 +350,9 @@ mod tests {
         let rules = vec![
             AlertRule::AnyTransaction,
             AlertRule::TransactionFailed,
-            AlertRule::LargeTransfer { threshold_xlm: 10_000 },
+            AlertRule::LargeTransfer {
+                threshold_xlm: 10_000,
+            },
             AlertRule::AdminFunctionCalled {
                 function_names: vec!["set_admin".into()],
             },
@@ -351,7 +375,12 @@ mod tests {
     fn high_fee_fires_at_threshold() {
         let mut tx = make_tx(true, None, None);
         tx.fee_charged_stroops = Some(10_000);
-        let payloads = run(&[AlertRule::HighFee { threshold_stroops: 10_000 }], &tx);
+        let payloads = run(
+            &[AlertRule::HighFee {
+                threshold_stroops: 10_000,
+            }],
+            &tx,
+        );
         assert_eq!(payloads.len(), 1);
         assert!(payloads[0].rule_triggered.contains("HighFee"));
     }
@@ -360,33 +389,39 @@ mod tests {
     fn high_fee_does_not_fire_below_threshold() {
         let mut tx = make_tx(true, None, None);
         tx.fee_charged_stroops = Some(9_999);
-        let payloads = run(&[AlertRule::HighFee { threshold_stroops: 10_000 }], &tx);
+        let payloads = run(
+            &[AlertRule::HighFee {
+                threshold_stroops: 10_000,
+            }],
+            &tx,
+        );
         assert!(payloads.is_empty());
     }
 
     #[test]
     fn high_fee_no_fee_does_not_fire() {
         let tx = make_tx(true, None, None);
-        let payloads = run(&[AlertRule::HighFee { threshold_stroops: 1 }], &tx);
+        let payloads = run(
+            &[AlertRule::HighFee {
+                threshold_stroops: 1,
+            }],
+            &tx,
+        );
         assert!(payloads.is_empty());
     }
 
     #[test]
     fn enriched_transaction_parses_timestamp() {
         let raw = HorizonTransaction {
-            hash:         "h1".into(),
-            created_at:   "2024-06-01T00:00:00Z".into(),
-            successful:   true,
+            hash: "h1".into(),
+            created_at: "2024-06-01T00:00:00Z".into(),
+            successful: true,
             paging_token: "1".into(),
-            fee_charged:  Some("100".into()),
+            fee_charged: Some("100".into()),
             envelope_xdr: None,
-            result_xdr:   None,
+            result_xdr: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, None, None, None).unwrap();
         assert_eq!(enriched.timestamp.year(), 2024);
     }
 }
-
-// bring chrono::Datelike into scope for the test above
-#[cfg(test)]
-use chrono::Datelike;

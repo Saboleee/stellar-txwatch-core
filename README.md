@@ -92,6 +92,30 @@ Set `RUST_LOG=debug` for verbose output.
 
 ---
 
+## Docker
+
+Build the image:
+
+```bash
+docker build -t txwatch .
+```
+
+Run with a config file:
+
+```bash
+docker run -v $(pwd)/config.toml:/config.toml txwatch --config /config.toml watch
+```
+
+Or validate your config:
+
+```bash
+docker run -v $(pwd)/config.toml:/config.toml txwatch --config /config.toml validate
+```
+
+For local development with webhook testing, see [Local Development with Docker Compose](#local-development-with-docker-compose) in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+---
+
 ## CLI
 
 ```
@@ -160,6 +184,7 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
   "transaction_hash": "abc123...",
   "function_name":    "transfer",
   "amount_xlm":       15000,
+  "fee_charged_stroops": 50000,
   "timestamp":        1705316096,
   "timestamp_iso":    "2024-01-15T12:00:00Z",
   "horizon_link":     "https://horizon-testnet.stellar.org/transactions/abc123..."
