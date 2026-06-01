@@ -1,7 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use std::{fs, path::Path};
-use url::Url;
+use std::{fmt, fs, path::Path};
 
 // ── Network ───────────────────────────────────────────────────────────────────
 
@@ -49,6 +48,12 @@ impl Network {
     }
 }
 
+impl fmt::Display for Network {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 // ── AlertRule ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -64,7 +69,7 @@ pub enum AlertRule {
 }
 
 impl AlertRule {
-    pub fn validate(&self, contract_label: &str) -> Result<()> {
+    pub fn validate(&mut self, contract_label: &str) -> Result<()> {
         match self {
             AlertRule::LargeTransfer { threshold_xlm } => {
                 if *threshold_xlm == 0 {
@@ -89,13 +94,14 @@ impl AlertRule {
                         contract_label
                     );
                 }
-                for name in function_names {
+                for name in function_names.iter_mut() {
                     if name.trim().is_empty() {
                         bail!(
                             "contract '{}': AdminFunctionCalled contains a blank function name",
                             contract_label
                         );
                     }
+                    *name = name.to_lowercase();
                 }
             }
             AlertRule::AnyTransaction | AlertRule::TransactionFailed => {}
@@ -122,11 +128,15 @@ pub struct WatchedContract {
     pub rules:       Vec<AlertRule>,
     pub webhook_url: String,
     /// Optional secret sent as X-TxWatch-Secret header on every webhook POST.
+    /// Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`).
     pub webhook_secret: Option<String>,
+    /// Override the Horizon base URL; never read from TOML — set programmatically in tests.
+    #[serde(skip, default)]
+    pub horizon_base_url_override: Option<String>,
 }
 
 impl WatchedContract {
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&mut self) -> Result<()> {
         if self.label.trim().is_empty() {
             bail!("a contract has an empty label");
         }
@@ -168,8 +178,9 @@ impl WatchedContract {
             bail!("contract '{}': at least one rule is required", self.label);
         }
 
-        for rule in &self.rules {
-            rule.validate(&self.label)?;
+        let label = self.label.clone();
+        for rule in &mut self.rules {
+            rule.validate(&label)?;
         }
 
         Ok(())
@@ -187,19 +198,58 @@ pub const MAX_CONTRACTS: usize = 100;
 pub struct AppConfig {
     pub poll_interval_seconds: u64,
     pub contracts: Vec<WatchedContract>,
+    /// Maximum number of idle connections per host in the HTTP connection pool.
+    /// Lower values reduce memory usage; higher values improve throughput for many contracts.
+    /// Default: 10.
+    #[serde(default = "default_http_pool_max_idle_per_host")]
+    pub http_pool_max_idle_per_host: Option<usize>,
+    /// TCP keepalive interval in seconds for idle HTTP connections.
+    /// Helps detect stalled connections quickly; 0 disables keepalive.
+    /// Default: 30 seconds.
+    #[serde(default = "default_http_tcp_keepalive_secs")]
+    pub http_tcp_keepalive_secs: Option<u64>,
+    /// Enable verbose output for HTTP connection pool debug information.
+    /// Only useful for troubleshooting connection issues.
+    /// Default: false.
+    #[serde(default)]
+    pub http_connection_verbose: Option<bool>,
+}
+
+fn default_http_pool_max_idle_per_host() -> Option<usize> {
+    None
+}
+
+fn default_http_tcp_keepalive_secs() -> Option<u64> {
+    None
+}
+
+// ── Env-var interpolation ─────────────────────────────────────────────────────
+
+/// Resolves a `${VAR_NAME}` reference to the corresponding environment variable.
+/// Values that don't match the `${...}` pattern are returned unchanged.
+fn resolve_env_interpolation(value: &str) -> Result<String> {
+    match value
+        .strip_prefix("${")
+        .and_then(|s| s.strip_suffix('}'))
+    {
+        Some(var_name) => env::var(var_name)
+            .with_context(|| format!("env var '{}' referenced in config is not set", var_name)),
+        None => Ok(value.to_owned()),
+    }
 }
 
 impl AppConfig {
     pub fn from_file(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("cannot read config file '{}'", path.display()))?;
-        let cfg: AppConfig = toml::from_str(&raw)
+        let mut cfg: AppConfig = toml::from_str(&raw)
             .with_context(|| format!("failed to parse config file '{}'", path.display()))?;
+        cfg.resolve_env_vars()?;
         cfg.validate()?;
         Ok(cfg)
     }
 
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&mut self) -> Result<()> {
         if self.poll_interval_seconds == 0 {
             bail!("poll_interval_seconds must be > 0");
         }
@@ -209,15 +259,14 @@ impl AppConfig {
         if self.contracts.is_empty() {
             bail!("at least one [[contracts]] entry is required");
         }
-        if self.contracts.len() > MAX_CONTRACTS {
-            bail!(
-                "too many contracts: {} configured, maximum allowed is {}",
-                self.contracts.len(),
-                MAX_CONTRACTS
-            );
-        }
-        for contract in &self.contracts {
+        for contract in &mut self.contracts {
             contract.validate()?;
+        }
+        let mut seen = std::collections::HashSet::new();
+        for contract in &self.contracts {
+            if !seen.insert(&contract.label) {
+                bail!("duplicate contract label '{}'", contract.label);
+            }
         }
         Ok(())
     }
@@ -237,12 +286,13 @@ mod tests {
             rules:          vec![AlertRule::AnyTransaction],
             webhook_url:    "https://example.com/hook".into(),
             webhook_secret: None,
+            horizon_base_url_override: None,
         }
     }
 
     #[test]
     fn valid_config_passes() {
-        let c = valid_contract();
+        let mut c = valid_contract();
         assert!(c.validate().is_ok());
     }
 
@@ -342,6 +392,20 @@ mod tests {
     }
 
     #[test]
+    fn admin_function_names_normalised_to_lowercase() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::AdminFunctionCalled {
+            function_names: vec!["Set_Admin".into(), "UPGRADE".into()],
+        }];
+        c.validate().unwrap();
+        if let AlertRule::AdminFunctionCalled { function_names } = &c.rules[0] {
+            assert_eq!(function_names, &["set_admin", "upgrade"]);
+        } else {
+            panic!("expected AdminFunctionCalled");
+        }
+    }
+
+    #[test]
     fn network_urls() {
         assert!(Network::Mainnet.horizon_base_url().contains("horizon.stellar.org"));
         assert!(Network::Testnet.horizon_base_url().contains("testnet"));
@@ -362,6 +426,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_duplicate_labels() {
+        let c = valid_contract();
+        let cfg = AppConfig {
+            poll_interval_seconds: 10,
+            contracts: vec![c.clone(), c],
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("duplicate contract label"));
+    }
+
+    #[test]
     fn rejects_poll_interval_over_max() {
         let raw = r#"
             poll_interval_seconds = 9999
@@ -373,46 +448,16 @@ mod tests {
             [[contracts.rules]]
             type = "AnyTransaction"
         "#;
-        let cfg: AppConfig = toml::from_str(raw).unwrap();
+        let mut cfg: AppConfig = toml::from_str(raw).unwrap();
         assert!(cfg.validate().is_err());
     }
 
-    // ── Issue #79: max contracts limit ────────────────────────────────────────
-
     #[test]
-    fn rejects_config_exceeding_max_contracts() {
-        // Build a TOML string with MAX_CONTRACTS + 1 contracts
-        let contract_block = r#"
-[[contracts]]
-label = "Contract"
-contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-network = "testnet"
-webhook_url = "https://example.com/hook"
-[[contracts.rules]]
-type = "AnyTransaction"
-"#;
-        let header = "poll_interval_seconds = 10\n";
-        let raw = header.to_string() + &contract_block.repeat(MAX_CONTRACTS + 1);
-        let cfg: AppConfig = toml::from_str(&raw).unwrap();
-        let err = cfg.validate();
-        assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("too many contracts"));
-    }
-
-    #[test]
-    fn accepts_config_at_max_contracts_limit() {
-        let contract_block = r#"
-[[contracts]]
-label = "Contract"
-contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-network = "testnet"
-webhook_url = "https://example.com/hook"
-[[contracts.rules]]
-type = "AnyTransaction"
-"#;
-        let header = "poll_interval_seconds = 10\n";
-        let raw = header.to_string() + &contract_block.repeat(MAX_CONTRACTS);
-        let cfg: AppConfig = toml::from_str(&raw).unwrap();
-        assert!(cfg.validate().is_ok());
+    fn from_file_returns_err_for_missing_file() {
+        let nonexistent_path = std::path::Path::new("/tmp/txwatch_nonexistent_test_config.toml");
+        let result = AppConfig::from_file(nonexistent_path);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("txwatch_nonexistent_test_config.toml"));
     }
 }

@@ -5,14 +5,23 @@ use clap::{Parser, Subcommand};
 use reqwest::Client;
 use tracing::info;
 use txwatch_config::AppConfig;
-use txwatch_notifier::{send_webhook, test_payload};
+use txwatch_notifier::{send_webhook, test_payload_with_network};
 
 // ── CLI definition ────────────────────────────────────────────────────────────
+
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("TXWATCH_GIT_SHA"),
+    " built ",
+    env!("TXWATCH_BUILD_TIMESTAMP"),
+    ")"
+);
 
 #[derive(Parser)]
 #[command(
     name    = "txwatch",
-    version = "0.1.0",
+    version = VERSION,
     about   = "Stellar Soroban contract monitor & webhook alert engine"
 )]
 struct Cli {
@@ -30,6 +39,8 @@ enum Command {
     Watch,
 
     /// Parse and validate the config file, then print a summary
+    ///
+    /// Exit codes: 0 = valid config, 1 = invalid or missing config
     Validate,
 
     /// Send a test webhook payload to a URL and exit
@@ -75,7 +86,14 @@ async fn main() -> Result<()> {
         }
 
         Command::TestWebhook { url, label } => {
-            let payload = test_payload(&label, &url);
+            let cfg = AppConfig::from_file(&cli.config)?;
+            if cfg.contracts.is_empty() {
+                return Err(anyhow::anyhow!("config has no contracts; cannot derive network for test-webhook"));
+            }
+            let first_contract = &cfg.contracts[0];
+            let network_name = first_contract.network.as_str();
+            let horizon_base_url = first_contract.network.horizon_base_url();
+            let payload = test_payload_with_network(&label, &url, network_name, horizon_base_url);
             let client  = Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
@@ -91,6 +109,7 @@ async fn main() -> Result<()> {
         Command::Watch => {
             let cfg = AppConfig::from_file(&cli.config)?;
             info!(
+                version        = VERSION,
                 contracts      = cfg.contracts.len(),
                 interval_secs  = cfg.poll_interval_seconds,
                 "starting TxWatch"
