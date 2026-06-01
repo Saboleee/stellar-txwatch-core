@@ -180,7 +180,10 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
         AlertRule::AdminFunctionCalled { function_names } => tx
             .function_name
             .as_deref()
-            .map(|f| function_names.iter().any(|n| n == f))
+            .map(|f| {
+                let f_lower = f.to_lowercase();
+                function_names.iter().any(|n| n.to_lowercase() == f_lower)
+            })
             .unwrap_or(false),
 
         AlertRule::HighFee { threshold_stroops } => tx
