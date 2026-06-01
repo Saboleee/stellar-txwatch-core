@@ -109,7 +109,7 @@ pub fn test_payload(label: &str, webhook_url: &str) -> AlertPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn sample_payload() -> AlertPayload {
@@ -186,5 +186,22 @@ mod tests {
         let p = test_payload("My Contract", "https://example.com/hook");
         assert!(p.label.contains("My Contract"));
         assert_eq!(p.rule_triggered, "TestWebhook");
+    }
+
+    #[tokio::test]
+    async fn version_header_is_present_on_every_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .and(header("X-TxWatch-Version", env!("CARGO_PKG_VERSION")))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let url = format!("{}/hook", server.uri());
+        let result = send_webhook(&client, &url, &sample_payload(), None).await;
+        assert!(result.is_ok());
     }
 }
