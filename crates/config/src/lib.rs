@@ -305,16 +305,6 @@ impl AppConfig {
         Ok(cfg)
     }
 
-    /// Resolve `${ENV_VAR}` interpolation in `webhook_secret` fields.
-    fn resolve_env_vars(&mut self) -> Result<()> {
-        for contract in &mut self.contracts {
-            if let Some(secret) = &contract.webhook_secret {
-                contract.webhook_secret = Some(resolve_env_interpolation(secret)?);
-            }
-        }
-        Ok(())
-    }
-
     pub fn validate(&mut self) -> Result<()> {
         if self.poll_interval_seconds == 0 {
             bail!("poll_interval_seconds must be > 0");
@@ -384,11 +374,8 @@ mod tests {
         assert!(c.validate().is_err());
     }
 
-    // ── Issue #80: full URL validation ────────────────────────────────────────
-
     #[test]
     fn rejects_webhook_url_with_no_host() {
-        // "https://" alone has no host — previously passed the prefix check
         let mut c = valid_contract();
         c.webhook_url = "https://".into();
         assert!(c.validate().is_err());
@@ -396,7 +383,6 @@ mod tests {
 
     #[test]
     fn rejects_webhook_url_with_spaces() {
-        // Spaces make the URL unparseable
         let mut c = valid_contract();
         c.webhook_url = "https://example .com/hook".into();
         assert!(c.validate().is_err());
@@ -462,6 +448,27 @@ mod tests {
         assert!(c.validate().is_err());
     }
 
+    /// Issue #18: blank entry in function_names should fail validation.
+    #[test]
+    fn rejects_blank_entry_in_admin_function_names() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::AdminFunctionCalled {
+            function_names: vec!["set_admin".into(), " ".into()],
+        }];
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("blank"), "expected 'blank' in error, got: {}", err);
+    }
+
+    /// Issue #18: single valid entry in function_names should pass validation.
+    #[test]
+    fn accepts_single_valid_admin_function_name() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::AdminFunctionCalled {
+            function_names: vec!["set_admin".into()],
+        }];
+        assert!(c.validate().is_ok());
+    }
+
     #[test]
     fn admin_function_names_normalised_to_lowercase() {
         let mut c = valid_contract();
@@ -478,9 +485,7 @@ mod tests {
 
     #[test]
     fn network_urls() {
-        assert!(Network::Mainnet
-            .horizon_base_url()
-            .contains("horizon.stellar.org"));
+        assert!(Network::Mainnet.horizon_base_url().contains("horizon.stellar.org"));
         assert!(Network::Testnet.horizon_base_url().contains("testnet"));
         assert!(Network::Futurenet.horizon_base_url().contains("futurenet"));
     }
@@ -512,8 +517,6 @@ mod tests {
         assert!(err.to_string().contains("duplicate contract label"));
     }
 
-    // ── Issue #94: AppConfig::validate rejects empty contracts ────────────────
-
     #[test]
     fn appconfig_validate_rejects_empty_contracts() {
         let mut cfg = AppConfig {
@@ -530,8 +533,6 @@ mod tests {
             err
         );
     }
-
-    // ── Issue #96: HighFee threshold_xlm convenience alternative ─────────────
 
     #[test]
     fn high_fee_threshold_xlm_normalises_to_stroops() {

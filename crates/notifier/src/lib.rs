@@ -4,9 +4,9 @@
 //! exposing `send_webhook` and `test_payload` helpers for webhook delivery.
 
 use anyhow::{anyhow, Result};
-use chrono::Utc;
 use reqwest::Client;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::oneshot;
 use tracing::{error, info, span, warn, Level};
 use txwatch_rules::AlertPayload;
 
@@ -24,12 +24,14 @@ pub struct DeliveryResult {
 /// POST `payload` to `url`, retrying up to `MAX_RETRIES` times with
 /// exponential backoff (2 s → 4 s → 8 s). Logs each attempt.
 /// If `secret` is Some, adds an `X-TxWatch-Secret` header to every request.
+/// If `shutdown` fires during a retry sleep, returns an error immediately.
 /// Returns a [`DeliveryResult`] describing how many attempts were needed.
 pub async fn send_webhook(
     client: &Client,
     url: &str,
     payload: &AlertPayload,
     secret: Option<&str>,
+    mut shutdown: oneshot::Receiver<()>,
 ) -> Result<DeliveryResult> {
     let span = span!(Level::INFO, "send_webhook", contract = %payload.label, rule = %payload.rule_triggered);
     let _enter = span.enter();
@@ -88,7 +90,12 @@ pub async fn send_webhook(
         }
 
         if attempt < MAX_RETRIES {
-            tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))) => {}
+                _ = &mut shutdown => {
+                    return Err(anyhow!("webhook retry aborted: shutdown signal received"));
+                }
+            }
         }
     }
 
@@ -114,10 +121,12 @@ pub fn test_payload_with_network(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
+    // 56-character contract ID starting with 'C' (fix for issue #13)
+    let contract_id = "CTEST0000000000000000000000000000000000000000000000000000";
     let hash = "0000000000000000000000000000000000000000000000000000000000000000";
     AlertPayload {
         label:            label.to_string(),
-        contract_id:      "CTEST000000000000000000000000000000000000000000000000000".into(),
+        contract_id:      contract_id.into(),
         network:          network.to_string(),
         rule_type:        "TestWebhook".into(),
         rule_triggered:   "TestWebhook".into(),
@@ -127,7 +136,7 @@ pub fn test_payload_with_network(
         amount_xlm:       None,
         fee_charged_stroops: None,
         timestamp:        ts,
-        timestamp_iso:    "1970-01-01T00:00:00Z".into(),
+        timestamp_iso:    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         horizon_link:     format!("{}/transactions/{}", horizon_base_url, hash),
         explorer_link:    format!("https://stellar.expert/explorer/{}/tx/{}", network, hash),
     }
@@ -137,34 +146,6 @@ pub fn test_payload_with_network(
 /// Build a synthetic `AlertPayload` suitable for `test-webhook`.
 pub fn test_payload(label: &str, webhook_url: &str) -> AlertPayload {
     test_payload_with_network(label, webhook_url, "testnet", "https://horizon-testnet.stellar.org")
-}
-
-/// Build a synthetic `AlertPayload` with an explicit network name and Horizon base URL.
-pub fn test_payload_with_network(
-    label: &str,
-    webhook_url: &str,
-    network: &str,
-    horizon_base_url: &str,
-) -> AlertPayload {
-    let now = Utc::now();
-    let tx_hash = "0000000000000000000000000000000000000000000000000000000000000000";
-    AlertPayload {
-        label:            label.to_string(),
-        contract_id:      "CTEST000000000000000000000000000000000000000000000000000".into(),
-        network:          network.to_string(),
-        rule_type:        "TestWebhook".into(),
-        rule_triggered:   "TestWebhook".into(),
-        transaction_hash: tx_hash.into(),
-        function_name:    Some("test".into()),
-        function_names:   vec!["test".into()],
-        amount_xlm:       None,
-        fee_charged_stroops: None,
-        timestamp:        now.timestamp(),
-        timestamp_iso:    now.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-        horizon_link:     format!("{}/transactions/{}", horizon_base_url, tx_hash),
-        explorer_link:    format!("https://stellar.expert/explorer/{}/tx/{}", network, tx_hash),
-    }
-    .with_label(format!("{} (test-webhook to {})", label, webhook_url))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -194,6 +175,10 @@ mod tests {
         }
     }
 
+    fn dummy_shutdown() -> oneshot::Receiver<()> {
+        oneshot::channel().1
+    }
+
     #[tokio::test]
     async fn delivers_on_first_attempt() {
         let server = MockServer::start().await;
@@ -204,9 +189,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = build_client().unwrap();
+        let client = Client::new();
         let url = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload(), None).await;
+        let result = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await;
         assert!(result.is_ok());
         let delivery = result.unwrap();
         assert_eq!(delivery.attempts, 1);
@@ -216,7 +201,6 @@ mod tests {
     #[tokio::test]
     async fn retries_on_server_error_then_succeeds() {
         let server = MockServer::start().await;
-        // First call returns 500, second returns 200
         Mock::given(method("POST"))
             .and(path("/hook"))
             .respond_with(ResponseTemplate::new(500))
@@ -229,13 +213,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = build_client().unwrap();
+        let client = Client::new();
         let url = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload(), None).await;
+        let result = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await;
         assert!(result.is_ok());
     }
-
-    // ── Issue #113: DeliveryResult.attempts ───────────────────────────────────
 
     #[tokio::test]
     async fn attempts_is_two_when_first_fails_and_second_succeeds() {
@@ -254,7 +236,7 @@ mod tests {
 
         let client = Client::new();
         let url = format!("{}/hook", server.uri());
-        let delivery = send_webhook(&client, &url, &sample_payload(), None)
+        let delivery = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown())
             .await
             .expect("should succeed on second attempt");
         assert_eq!(delivery.attempts, 2);
@@ -270,20 +252,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = build_client().unwrap();
+        let client = Client::new();
         let url = format!("{}/hook", server.uri());
-        send_webhook(&client, &url, &sample_payload(), Some("mysecret")).await.unwrap();
+        send_webhook(&client, &url, &sample_payload(), Some("mysecret"), dummy_shutdown()).await.unwrap();
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
-        assert!(
-            requests[0].headers.contains_key("x-txwatch-secret"),
-            "X-TxWatch-Secret header should be present when secret is provided"
-        );
-        assert_eq!(
-            requests[0].headers.get("x-txwatch-secret").unwrap(),
-            "mysecret"
-        );
+        assert!(requests[0].headers.contains_key("x-txwatch-secret"));
+        assert_eq!(requests[0].headers.get("x-txwatch-secret").unwrap(), "mysecret");
     }
 
     #[tokio::test]
@@ -295,18 +271,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = build_client().unwrap();
+        let client = Client::new();
         let url = format!("{}/hook", server.uri());
-        send_webhook(&client, &url, &sample_payload(), None)
-            .await
-            .unwrap();
+        send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await.unwrap();
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
-        assert!(
-            !requests[0].headers.contains_key("x-txwatch-secret"),
-            "X-TxWatch-Secret header should not be present when secret is None"
-        );
+        assert!(!requests[0].headers.contains_key("x-txwatch-secret"));
     }
 
     #[tokio::test]
@@ -318,17 +289,62 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = build_client().unwrap();
+        let client = Client::new();
         let url = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload(), None).await;
+        let result = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await;
         assert!(result.is_err());
     }
 
+    /// Issue #14: shutdown signal aborts in-flight retry sleep promptly.
+    #[tokio::test]
+    async fn shutdown_aborts_retry_sleep() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let client = Client::new();
+        let url = format!("{}/hook", server.uri());
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(());
+        });
+
+        let start = std::time::Instant::now();
+        let result = send_webhook(&client, &url, &sample_payload(), None, rx).await;
+        assert!(start.elapsed() < Duration::from_secs(2), "shutdown did not abort retry promptly");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("shutdown"), "error should mention shutdown, got: {}", msg);
+    }
+
+    /// Issue #13: test_payload produces a structurally valid AlertPayload (56-char contract ID).
     #[test]
-    fn test_payload_builds_without_panic() {
+    fn test_payload_is_structurally_valid() {
         let p = test_payload("My Contract", "https://example.com/hook");
         assert!(p.label.contains("My Contract"));
         assert_eq!(p.rule_triggered, "TestWebhook");
+        assert_eq!(p.contract_id.len(), 56, "contract_id must be 56 characters");
+        assert!(p.contract_id.starts_with('C'), "contract_id must start with 'C'");
+        assert!(p.horizon_link.contains("/transactions/"), "horizon_link must contain /transactions/");
+        assert!(p.explorer_link.contains("stellar.expert"), "explorer_link must point to stellar.expert");
+    }
+
+    /// Issue #13: test_payload_with_network derives links from the supplied network config.
+    #[test]
+    fn test_payload_with_network_derives_links_from_config() {
+        let p = test_payload_with_network(
+            "Label",
+            "https://example.com/hook",
+            "mainnet",
+            "https://horizon.stellar.org",
+        );
+        assert!(p.horizon_link.starts_with("https://horizon.stellar.org/transactions/"));
+        assert!(p.explorer_link.contains("/mainnet/"));
     }
 
     #[tokio::test]
@@ -342,9 +358,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = build_client().unwrap();
+        let client = Client::new();
         let url = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload(), None).await;
+        let result = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await;
         assert!(result.is_ok());
     }
 
@@ -363,7 +379,7 @@ mod tests {
 
         let client = Client::new();
         let url = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload(), None).await;
+        let result = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await;
         assert!(result.is_ok());
     }
 }
