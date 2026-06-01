@@ -50,8 +50,10 @@ struct OpsEmbedded {
 
 #[derive(Default)]
 struct Counters {
-    transactions: AtomicU64,
-    alerts:       AtomicU64,
+    transactions:          AtomicU64,
+    alerts:                AtomicU64,
+    interval_transactions: AtomicU64,
+    interval_alerts:       AtomicU64,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -61,8 +63,14 @@ struct Counters {
 /// Logs a summary every 60 seconds: contracts watched, transactions processed,
 /// alerts fired.
 pub async fn run(cfg: AppConfig) -> Result<()> {
+    // Build HTTP client with connection pool tuning options.
+    let max_idle = cfg.http_pool_max_idle_per_host.unwrap_or(10);
+    let keepalive_secs = cfg.http_tcp_keepalive_secs.unwrap_or(30);
+
     let client = Client::builder()
         .timeout(Duration::from_secs(15))
+        .pool_max_idle_per_host(max_idle)
+        .tcp_keepalive(Some(Duration::from_secs(keepalive_secs)))
         .build()
         .context("failed to build HTTP client")?;
 
@@ -77,8 +85,17 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
     let counters      = Arc::new(Counters::default());
     let n_contracts   = cfg.contracts.len();
 
+    let contracts_list = cfg.contracts.iter().map(|c| c.label.as_str()).collect::<Vec<_>>().join(", ");
+    let mut networks: Vec<&str> = cfg.contracts.iter().map(|c| c.network.as_str()).collect();
+    networks.sort();
+    networks.dedup();
+    let networks_str = networks.join(", ");
+
     info!(
+        version       = env!("CARGO_PKG_VERSION"),
         contracts     = n_contracts,
+        contracts_list = %contracts_list,
+        networks      = %networks_str,
         interval_secs = cfg.poll_interval_seconds,
         "TxWatch polling engine started"
     );
@@ -88,10 +105,14 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(summary_every).await;
+            let interval_txs    = counters_clone.interval_transactions.swap(0, Ordering::Relaxed);
+            let interval_alerts = counters_clone.interval_alerts.swap(0, Ordering::Relaxed);
             info!(
-                contracts    = n_contracts,
-                transactions = counters_clone.transactions.load(Ordering::Relaxed),
-                alerts       = counters_clone.alerts.load(Ordering::Relaxed),
+                contracts             = n_contracts,
+                transactions_total    = counters_clone.transactions.load(Ordering::Relaxed),
+                alerts_total          = counters_clone.alerts.load(Ordering::Relaxed),
+                transactions_interval = interval_txs,
+                alerts_interval       = interval_alerts,
                 "60-second summary"
             );
         }
@@ -103,6 +124,8 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
                 Ok((txs, alerts)) => {
                     counters.transactions.fetch_add(txs, Ordering::Relaxed);
                     counters.alerts.fetch_add(alerts, Ordering::Relaxed);
+                    counters.interval_transactions.fetch_add(txs, Ordering::Relaxed);
+                    counters.interval_alerts.fetch_add(alerts, Ordering::Relaxed);
                 }
                 Err(e) => {
                     error!(
@@ -125,6 +148,10 @@ async fn poll_contract(
     contract: &WatchedContract,
     cursors:  &mut HashMap<String, String>,
 ) -> Result<(u64, u64)> {
+    // Use contract_id as the cursor map key: contract IDs are unique per Stellar network,
+    // making them a stable and collision-free key. Using label instead would be unsafe
+    // since label uniqueness is only validated at config load time, and labels could
+    // theoretically collide if that validation is bypassed.
     let cursor = cursors
         .get(&contract.contract_id)
         .cloned()
@@ -273,6 +300,22 @@ async fn fetch_soroban_details(
     Ok((function_name, amount_stroops))
 }
 
+// ── Startup log field helpers (for testing) ──────────────────────────────────
+
+#[cfg(test)]
+fn startup_log_fields(cfg: &AppConfig) -> (String, String, String) {
+    let contracts_list = cfg.contracts.iter().map(|c| c.label.as_str()).collect::<Vec<_>>().join(", ");
+    let mut networks: Vec<&str> = cfg.contracts.iter().map(|c| c.network.as_str()).collect();
+    networks.sort();
+    networks.dedup();
+    let networks_str = networks.join(", ");
+    (
+        env!("CARGO_PKG_VERSION").to_string(),
+        contracts_list,
+        networks_str,
+    )
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -368,5 +411,44 @@ mod tests {
 
         assert!(fn_name.is_none());
         assert!(amount.is_none());
+    }
+
+    #[test]
+    fn startup_log_includes_version_contracts_list_and_networks() {
+        let cfg = AppConfig {
+            poll_interval_seconds: 10,
+            contracts: vec![
+                WatchedContract {
+                    label: "Contract A".into(),
+                    contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+                    network: txwatch_config::Network::Testnet,
+                    rules: vec![txwatch_config::AlertRule::AnyTransaction],
+                    webhook_url: "https://hooks.example.com/a".into(),
+                    webhook_secret: None,
+                },
+                WatchedContract {
+                    label: "Contract B".into(),
+                    contract_id: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into(),
+                    network: txwatch_config::Network::Mainnet,
+                    rules: vec![txwatch_config::AlertRule::AnyTransaction],
+                    webhook_url: "https://hooks.example.com/b".into(),
+                    webhook_secret: None,
+                },
+                WatchedContract {
+                    label: "Contract C".into(),
+                    contract_id: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC".into(),
+                    network: txwatch_config::Network::Mainnet,
+                    rules: vec![txwatch_config::AlertRule::AnyTransaction],
+                    webhook_url: "https://hooks.example.com/c".into(),
+                    webhook_secret: None,
+                },
+            ],
+        };
+
+        let (version, contracts_list, networks) = startup_log_fields(&cfg);
+
+        assert!(!version.is_empty());
+        assert_eq!(contracts_list, "Contract A, Contract B, Contract C");
+        assert_eq!(networks, "mainnet, testnet");
     }
 }

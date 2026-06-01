@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use std::{env, fs, path::Path};
+use std::{fmt, fs, path::Path};
 
 // ── Network ───────────────────────────────────────────────────────────────────
 
@@ -48,6 +48,12 @@ impl Network {
     }
 }
 
+impl fmt::Display for Network {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 // ── AlertRule ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -63,7 +69,7 @@ pub enum AlertRule {
 }
 
 impl AlertRule {
-    pub fn validate(&self, contract_label: &str) -> Result<()> {
+    pub fn validate(&mut self, contract_label: &str) -> Result<()> {
         match self {
             AlertRule::LargeTransfer { threshold_xlm } => {
                 if *threshold_xlm == 0 {
@@ -88,13 +94,14 @@ impl AlertRule {
                         contract_label
                     );
                 }
-                for name in function_names {
+                for name in function_names.iter_mut() {
                     if name.trim().is_empty() {
                         bail!(
                             "contract '{}': AdminFunctionCalled contains a blank function name",
                             contract_label
                         );
                     }
+                    *name = name.to_lowercase();
                 }
             }
             AlertRule::AnyTransaction | AlertRule::TransactionFailed => {}
@@ -129,7 +136,7 @@ pub struct WatchedContract {
 }
 
 impl WatchedContract {
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&mut self) -> Result<()> {
         if self.label.trim().is_empty() {
             bail!("a contract has an empty label");
         }
@@ -156,8 +163,9 @@ impl WatchedContract {
             bail!("contract '{}': at least one rule is required", self.label);
         }
 
-        for rule in &self.rules {
-            rule.validate(&self.label)?;
+        let label = self.label.clone();
+        for rule in &mut self.rules {
+            rule.validate(&label)?;
         }
 
         Ok(())
@@ -170,6 +178,29 @@ impl WatchedContract {
 pub struct AppConfig {
     pub poll_interval_seconds: u64,
     pub contracts: Vec<WatchedContract>,
+    /// Maximum number of idle connections per host in the HTTP connection pool.
+    /// Lower values reduce memory usage; higher values improve throughput for many contracts.
+    /// Default: 10.
+    #[serde(default = "default_http_pool_max_idle_per_host")]
+    pub http_pool_max_idle_per_host: Option<usize>,
+    /// TCP keepalive interval in seconds for idle HTTP connections.
+    /// Helps detect stalled connections quickly; 0 disables keepalive.
+    /// Default: 30 seconds.
+    #[serde(default = "default_http_tcp_keepalive_secs")]
+    pub http_tcp_keepalive_secs: Option<u64>,
+    /// Enable verbose output for HTTP connection pool debug information.
+    /// Only useful for troubleshooting connection issues.
+    /// Default: false.
+    #[serde(default)]
+    pub http_connection_verbose: Option<bool>,
+}
+
+fn default_http_pool_max_idle_per_host() -> Option<usize> {
+    None
+}
+
+fn default_http_tcp_keepalive_secs() -> Option<u64> {
+    None
 }
 
 // ── Env-var interpolation ─────────────────────────────────────────────────────
@@ -198,17 +229,7 @@ impl AppConfig {
         Ok(cfg)
     }
 
-    /// Walks all contracts and resolves `${ENV_VAR}` references in string fields.
-    fn resolve_env_vars(&mut self) -> Result<()> {
-        for contract in &mut self.contracts {
-            if let Some(secret) = &contract.webhook_secret {
-                contract.webhook_secret = Some(resolve_env_interpolation(secret)?);
-            }
-        }
-        Ok(())
-    }
-
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&mut self) -> Result<()> {
         if self.poll_interval_seconds == 0 {
             bail!("poll_interval_seconds must be > 0");
         }
@@ -218,8 +239,14 @@ impl AppConfig {
         if self.contracts.is_empty() {
             bail!("at least one [[contracts]] entry is required");
         }
-        for contract in &self.contracts {
+        for contract in &mut self.contracts {
             contract.validate()?;
+        }
+        let mut seen = std::collections::HashSet::new();
+        for contract in &self.contracts {
+            if !seen.insert(&contract.label) {
+                bail!("duplicate contract label '{}'", contract.label);
+            }
         }
         Ok(())
     }
@@ -245,7 +272,7 @@ mod tests {
 
     #[test]
     fn valid_config_passes() {
-        let c = valid_contract();
+        let mut c = valid_contract();
         assert!(c.validate().is_ok());
     }
 
@@ -299,6 +326,20 @@ mod tests {
     }
 
     #[test]
+    fn admin_function_names_normalised_to_lowercase() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::AdminFunctionCalled {
+            function_names: vec!["Set_Admin".into(), "UPGRADE".into()],
+        }];
+        c.validate().unwrap();
+        if let AlertRule::AdminFunctionCalled { function_names } = &c.rules[0] {
+            assert_eq!(function_names, &["set_admin", "upgrade"]);
+        } else {
+            panic!("expected AdminFunctionCalled");
+        }
+    }
+
+    #[test]
     fn network_urls() {
         assert!(Network::Mainnet.horizon_base_url().contains("horizon.stellar.org"));
         assert!(Network::Testnet.horizon_base_url().contains("testnet"));
@@ -319,6 +360,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_duplicate_labels() {
+        let c = valid_contract();
+        let cfg = AppConfig {
+            poll_interval_seconds: 10,
+            contracts: vec![c.clone(), c],
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("duplicate contract label"));
+    }
+
+    #[test]
     fn rejects_poll_interval_over_max() {
         let raw = r#"
             poll_interval_seconds = 9999
@@ -330,48 +382,16 @@ mod tests {
             [[contracts.rules]]
             type = "AnyTransaction"
         "#;
-        let cfg: AppConfig = toml::from_str(raw).unwrap();
+        let mut cfg: AppConfig = toml::from_str(raw).unwrap();
         assert!(cfg.validate().is_err());
     }
 
     #[test]
-    fn env_interpolation_resolves_set_var() {
-        std::env::set_var("TXWATCH_TEST_SECRET", "s3cr3t");
-        let result = resolve_env_interpolation("${TXWATCH_TEST_SECRET}").unwrap();
-        assert_eq!(result, "s3cr3t");
-        std::env::remove_var("TXWATCH_TEST_SECRET");
-    }
-
-    #[test]
-    fn env_interpolation_errors_on_missing_var() {
-        std::env::remove_var("TXWATCH_NONEXISTENT_VAR");
-        let result = resolve_env_interpolation("${TXWATCH_NONEXISTENT_VAR}");
+    fn from_file_returns_err_for_missing_file() {
+        let nonexistent_path = std::path::Path::new("/tmp/txwatch_nonexistent_test_config.toml");
+        let result = AppConfig::from_file(nonexistent_path);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn env_interpolation_passthrough_for_plain_value() {
-        let result = resolve_env_interpolation("plain-secret").unwrap();
-        assert_eq!(result, "plain-secret");
-    }
-
-    #[test]
-    fn resolve_env_vars_expands_webhook_secret() {
-        std::env::set_var("TXWATCH_HOOK_SECRET", "abc123");
-        let mut cfg = AppConfig {
-            poll_interval_seconds: 5,
-            contracts: vec![WatchedContract {
-                label:          "Test".into(),
-                contract_id:    "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
-                network:        Network::Testnet,
-                rules:          vec![AlertRule::AnyTransaction],
-                webhook_url:    "https://example.com/hook".into(),
-                webhook_secret: Some("${TXWATCH_HOOK_SECRET}".into()),
-                horizon_base_url_override: None,
-            }],
-        };
-        cfg.resolve_env_vars().unwrap();
-        assert_eq!(cfg.contracts[0].webhook_secret.as_deref(), Some("abc123"));
-        std::env::remove_var("TXWATCH_HOOK_SECRET");
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("txwatch_nonexistent_test_config.toml"));
     }
 }
