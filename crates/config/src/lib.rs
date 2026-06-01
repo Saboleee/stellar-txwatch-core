@@ -123,6 +123,7 @@ impl AlertRule {
 // ── WatchedContract ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WatchedContract {
     pub label:       String,
     pub contract_id: String,
@@ -197,6 +198,7 @@ impl WatchedContract {
 pub const MAX_CONTRACTS: usize = 100;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub poll_interval_seconds: u64,
     pub contracts: Vec<WatchedContract>,
@@ -461,5 +463,24 @@ mod tests {
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("txwatch_nonexistent_test_config.toml"));
+    }
+
+    #[test]
+    fn rejects_unknown_field_in_contract_toml() {
+        let raw = r#"
+            poll_interval_seconds = 10
+            [[contracts]]
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            webhook_secert = "typo"
+            [[contracts.rules]]
+            type = "AnyTransaction"
+        "#;
+        let result: Result<AppConfig, _> = toml::from_str(raw);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("unknown field") || err.contains("webhook_secert"));
     }
 }
