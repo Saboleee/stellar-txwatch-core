@@ -70,11 +70,11 @@ async fn run_polls_once_and_fires_webhook() {
     contract.horizon_base_url_override = Some(horizon.uri());
 
     let cfg = AppConfig {
-        poll_interval_seconds:      1,
-        contracts:                  vec![contract],
+        poll_interval_seconds: 1,
+        contracts: vec![contract],
         http_pool_max_idle_per_host: None,
-        http_tcp_keepalive_secs:    None,
-        http_connection_verbose:    None,
+        http_tcp_keepalive_secs: None,
+        http_connection_verbose: None,
     };
 
     // Drive the loop for one full poll cycle (slightly more than the interval).
@@ -384,7 +384,7 @@ async fn high_fee_rule_fires_on_fee_charged() {
         .mount(&receiver)
         .await;
 
-    let client   = txwatch_notifier::build_client().unwrap();
+    let client   = Client::new();
     let contract = helpers::contract(
         &format!("{}/hook", receiver.uri()),
         vec![AlertRule::HighFee { threshold_stroops: 10_000, threshold_xlm: None }],
