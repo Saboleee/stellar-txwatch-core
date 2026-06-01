@@ -192,6 +192,8 @@ async fn poll_contract(
         let paging_token = raw_tx.paging_token.clone();
         let tx_hash      = raw_tx.hash.clone();
 
+        // Advance the cursor before enrichment so the transaction is not re-processed
+        // even when op enrichment fails (for example, Horizon /operations returns 500).
         cursors.insert(contract.contract_id.clone(), paging_token.clone());
 
         let (function_name, amount_stroops) =
@@ -330,6 +332,7 @@ fn startup_log_fields(cfg: &AppConfig) -> (String, String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use txwatch_config::{AlertRule, Network};
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
