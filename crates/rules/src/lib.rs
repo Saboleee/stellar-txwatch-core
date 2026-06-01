@@ -304,6 +304,30 @@ mod tests {
     }
 
     #[test]
+    fn admin_function_called_rule_label_multi_entry_format() {
+        let tx = make_tx(true, Some("set_admin"), None);
+        let payloads = run(
+            &[AlertRule::AdminFunctionCalled {
+                function_names: vec!["set_admin".into(), "upgrade".into()],
+            }],
+            &tx,
+        );
+        assert_eq!(payloads[0].rule_triggered, "AdminFunctionCalled([set_admin, upgrade])");
+    }
+
+    #[test]
+    fn admin_function_called_rule_label_single_entry_format() {
+        let tx = make_tx(true, Some("set_admin"), None);
+        let payloads = run(
+            &[AlertRule::AdminFunctionCalled {
+                function_names: vec!["set_admin".into()],
+            }],
+            &tx,
+        );
+        assert_eq!(payloads[0].rule_triggered, "AdminFunctionCalled([set_admin])");
+    }
+
+    #[test]
     fn multiple_rules_can_fire_on_same_tx() {
         let tx = make_tx(false, Some("set_admin"), Some(200_000_000_000));
         let rules = vec![
