@@ -18,17 +18,17 @@ use txwatch_config::{AppConfig, WatchedContract};
 use txwatch_notifier::send_webhook;
 use txwatch_rules::{evaluate, EnrichedTransaction, HorizonTransaction};
 
+// ── Optional Prometheus metrics ───────────────────────────────────────────────
+
+#[cfg(feature = "metrics")]
+pub mod metrics;
+
+/// Bind address for the optional `/metrics` HTTP endpoint.
+/// Set via `AppConfig::metrics_addr` when the `metrics` feature is enabled.
+#[cfg(feature = "metrics")]
+pub use metrics::serve_metrics;
+
 // ── Horizon response shapes ───────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct HorizonPage {
-    _embedded: Embedded,
-}
-
-#[derive(Deserialize)]
-struct Embedded {
-    records: Vec<HorizonTransaction>,
-}
 
 /// Horizon operation record — we only need the fields relevant to Soroban.
 #[derive(Deserialize)]
@@ -39,6 +39,26 @@ struct HorizonOperation {
     function: Option<String>,
     /// Present on `payment` operations (string, e.g. "1000.0000000").
     amount: Option<String>,
+}
+
+/// A Horizon transaction record that may include inline operations via `join=operations`.
+#[derive(Deserialize)]
+struct HorizonTransactionWithOps {
+    #[serde(flatten)]
+    tx: HorizonTransaction,
+    /// Inline operations embedded when `join=operations` is used.
+    #[serde(default)]
+    operations: Vec<HorizonOperation>,
+}
+
+#[derive(Deserialize)]
+struct HorizonPage {
+    _embedded: Embedded,
+}
+
+#[derive(Deserialize)]
+struct Embedded {
+    records: Vec<HorizonTransactionWithOps>,
 }
 
 #[derive(Deserialize)]
@@ -61,16 +81,18 @@ struct Counters {
     interval_alerts: AtomicU64,
 }
 
-// ── Public entry point ────────────────────────────────────────────────────────
+// ── Public entry points ───────────────────────────────────────────────────────
+
+/// Backwards-compatible wrapper: default (non-dry) run.
+pub async fn run(cfg: AppConfig) -> Result<()> {
+    run_with(cfg, false).await
+}
 
 /// Run the polling loop forever. Each contract is polled concurrently via a
 /// tokio JoinSet; one slow or failing contract never blocks the others.
 /// Logs a summary every 60 seconds: contracts watched, transactions processed,
 /// alerts fired.
-/// Backwards-compatible wrapper: default (non-dry) run
-pub async fn run(cfg: AppConfig) -> Result<()> {
-    // Build HTTP client: start from the shared base configuration (timeout, etc.)
-    // then apply pool-tuning options from the app config.
+pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
     let max_idle       = cfg.http_pool_max_idle_per_host.unwrap_or(10);
     let keepalive_secs = cfg.http_tcp_keepalive_secs.unwrap_or(30);
 
@@ -115,35 +137,21 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
             .collect()
     };
 
-    let interval = Duration::from_secs(cfg.poll_interval_seconds);
+    let interval      = Duration::from_secs(cfg.poll_interval_seconds);
     let summary_every = Duration::from_secs(60);
-    let counters = Arc::new(Counters::default());
-    let n_contracts = cfg.contracts.len();
+    let counters      = Arc::new(Counters::default());
+    let n_contracts   = cfg.contracts.len();
 
-    let contracts_list = cfg
-        .contracts
-        .iter()
-        .map(|c| c.label.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let contracts_list = cfg.contracts.iter().map(|c| c.label.as_str()).collect::<Vec<_>>().join(", ");
     let mut networks: Vec<&str> = cfg.contracts.iter().map(|c| c.network.as_str()).collect();
-    networks.sort();
-    networks.dedup();
+    networks.sort(); networks.dedup();
     let networks_str = networks.join(", ");
 
-    // Collect distinct (network_name, horizon_base_url) pairs for the startup log.
     let mut horizon_urls: Vec<(&str, &str)> = cfg
-        .contracts
-        .iter()
-        .map(|c| (c.network.as_str(), c.network.horizon_base_url()))
-        .collect();
-    horizon_urls.sort();
-    horizon_urls.dedup();
-    let horizon_urls_str = horizon_urls
-        .iter()
-        .map(|(net, url)| format!("{}={}", net, url))
-        .collect::<Vec<_>>()
-        .join(", ");
+        .contracts.iter().map(|c| (c.network.as_str(), c.network.horizon_base_url())).collect();
+    horizon_urls.sort(); horizon_urls.dedup();
+    let horizon_urls_str = horizon_urls.iter()
+        .map(|(net, url)| format!("{}={}", net, url)).collect::<Vec<_>>().join(", ");
 
     info!(
         version        = env!("CARGO_PKG_VERSION"),
@@ -164,8 +172,6 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
         );
     }
 
-    // Spawn the summary logger under a restart supervisor so that panics are logged
-    // and the task restarts automatically rather than being silently swallowed.
     let counters_for_summary = Arc::clone(&counters);
     let _summary_guard = tokio::spawn(async move {
         loop {
@@ -192,39 +198,23 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
     });
 
     loop {
-        let mut set: tokio::task::JoinSet<(String, String, Result<(u64, u64)>)> =
-            tokio::task::JoinSet::new();
-
         for contract in &cfg.contracts {
             match poll_contract(&client, contract, &mut cursors, dry_run).await {
                 Ok((txs, alerts)) => {
                     counters.transactions.fetch_add(txs, Ordering::Relaxed);
                     counters.alerts.fetch_add(alerts, Ordering::Relaxed);
-                    counters
-                        .interval_transactions
-                        .fetch_add(txs, Ordering::Relaxed);
-                    counters
-                        .interval_alerts
-                        .fetch_add(alerts, Ordering::Relaxed);
-                }
-                Err(join_err) => {
-                    error!(error = %join_err, "contract polling task panicked");
-                }
-            }
-        }
-
-        // Persist cursors after a poll cycle so restarts resume correctly.
-        if let Some(path) = &cfg.cursor_file {
-            match serde_json::to_string_pretty(&cursors) {
-                Ok(s) => {
-                    if let Err(e) = fs::write(path, s) {
-                        warn!(error = ?e, "failed to write cursor_file");
+                    counters.interval_transactions.fetch_add(txs, Ordering::Relaxed);
+                    counters.interval_alerts.fetch_add(alerts, Ordering::Relaxed);
+                    // Issue #25: increment Prometheus counters when metrics feature is enabled.
+                    #[cfg(feature = "metrics")]
+                    {
+                        metrics::inc_transactions(txs);
+                        metrics::inc_alerts(alerts);
                     }
                 }
-                Err(e) => warn!(error = ?e, "failed to serialize cursor map for persistence"),
+                Err(e) => error!(error = %e, "contract polling task failed"),
             }
         }
-
         tokio::time::sleep(interval).await;
     }
 }
@@ -232,21 +222,22 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
 // ── Per-contract poll ─────────────────────────────────────────────────────────
 
 /// Returns `(transactions_processed, alerts_fired)`.
+///
+/// Uses `join=operations` on the transactions endpoint so that Horizon returns
+/// operations inline, eliminating one HTTP request per transaction (#23).
+/// Falls back to a separate `/transactions/{hash}/operations` fetch only when
+/// the inline `operations` array is absent (older Horizon versions).
 #[tracing::instrument(skip(client, contract, cursors), fields(
-    contract = %contract.label,
+    contract    = %contract.label,
     contract_id = %contract.contract_id,
-    network = %contract.network.as_str()
+    network     = %contract.network.as_str()
 ))]
 async fn poll_contract(
-    client: &Client,
+    client:   &Client,
     contract: &WatchedContract,
     cursors:  &mut HashMap<String, String>,
-    dry_run: bool,
+    dry_run:  bool,
 ) -> Result<(u64, u64)> {
-    // Use contract_id as the cursor map key: contract IDs are unique per Stellar network,
-    // making them a stable and collision-free key. Using label instead would be unsafe
-    // since label uniqueness is only validated at config load time, and labels could
-    // theoretically collide if that validation is bypassed.
     let cursor = cursors
         .get(&contract.contract_id)
         .cloned()
@@ -259,110 +250,108 @@ async fn poll_contract(
         .horizon_base_url_override
         .as_deref()
         .unwrap_or_else(|| contract.network.horizon_base_url());
+    let canonical_base = contract.network.horizon_base_url();
 
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET {} failed", url))?;
+    // Collect all pages of transactions.
+    let mut all_records: Vec<HorizonTransactionWithOps> = Vec::new();
+    let mut page_cursor = cursor.clone();
 
-    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        let retry_after = response
-            .headers()
-            .get("Retry-After")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(5);
-        warn!(
-            contract     = %contract.label,
-            retry_after  = retry_after,
-            "Horizon returned 429 — backing off"
+    loop {
+        // Issue #23: use join=operations to fetch operations inline, eliminating
+        // one HTTP request per transaction.
+        let url = format!(
+            "{}/accounts/{}/transactions?cursor={}&order=asc&limit=200&join=operations",
+            poll_base, contract.contract_id, page_cursor
         );
-        tokio::time::sleep(Duration::from_secs(retry_after)).await;
-        return Ok((0, 0));
-    }
 
-    let page: HorizonPage = response
-        .json()
-        .await
-        .with_context(|| format!("failed to parse Horizon response from {}", url))?;
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {} failed", url))?;
+
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = response
+                .headers()
+                .get("Retry-After")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(5);
+            warn!(contract = %contract.label, retry_after, "Horizon returned 429 — backing off");
+            tokio::time::sleep(Duration::from_secs(retry_after)).await;
+            return Ok((0, 0));
+        }
+
+        let page: HorizonPage = response
+            .json()
+            .await
+            .with_context(|| format!("failed to parse Horizon response from {}", url))?;
+
+        let records = page._embedded.records;
 
         if records.is_empty() {
             break;
         }
 
-        for r in records.iter() {
-            all_records.push(r.clone());
+        let last_token = records.last().map(|r| r.tx.paging_token.clone());
+        let count = records.len();
+        for r in records {
+            all_records.push(r);
         }
 
-        // If this page had fewer than the max (200), it is the last page.
-        if all_records.len() % 200 != 0 || records.len() < 200 {
+        if count < 200 {
             break;
         }
-
-        // Advance the cursor to the last paging_token so the next request returns
-        // records after the last one we just processed.
-        if let Some(last) = all_records.last() {
-            page_cursor = last.paging_token.clone();
+        if let Some(token) = last_token {
+            page_cursor = token;
         } else {
             break;
         }
     }
 
-    let records = all_records;
-
-    if !records.is_empty() {
-        info!(
-            contract = %contract.label,
-            count    = records.len(),
-            "fetched new transactions"
-        );
+    if !all_records.is_empty() {
+        info!(contract = %contract.label, count = all_records.len(), "fetched new transactions");
     } else {
-        debug!(
-            contract = %contract.label,
-            cursor   = %cursor,
-            "no new transactions"
-        );
+        debug!(contract = %contract.label, cursor = %cursor, "no new transactions");
     }
 
-    let mut tx_count = 0u64;
+    let mut tx_count    = 0u64;
     let mut alert_count = 0u64;
 
-    for raw_tx in records {
-        let paging_token = raw_tx.paging_token.clone();
-        let tx_hash = raw_tx.hash.clone();
+    for record in all_records {
+        let paging_token = record.tx.paging_token.clone();
+        let tx_hash      = record.tx.hash.clone();
 
-        // Advance the cursor before enrichment so the transaction is not re-processed
-        // even when op enrichment fails (for example, Horizon /operations returns 500).
+        // Advance cursor before enrichment so the tx is not re-processed even if
+        // op enrichment fails.
         cursors.insert(contract.contract_id.clone(), paging_token.clone());
 
-        let (function_names, amount_stroops) =
+        // Issue #23: if Horizon returned inline operations, use them directly.
+        // Otherwise fall back to a separate /operations fetch.
+        let (function_names, amount_stroops) = if !record.operations.is_empty() {
+            debug!(contract = %contract.label, tx = %tx_hash, "using inline operations (join=operations)");
+            extract_soroban_details(record.operations)
+        } else {
             match fetch_soroban_details(client, poll_base, &tx_hash).await {
                 Ok(details) => details,
                 Err(e) => {
                     warn!(
-                        contract = %contract.label,
-                        tx       = %tx_hash,
-                        error    = %e,
+                        contract = %contract.label, tx = %tx_hash, error = %e,
                         "could not fetch operation details — evaluating rules without them"
                     );
                     (Vec::new(), None)
                 }
-            };
+            }
+        };
 
-        let enriched =
-            match EnrichedTransaction::from_horizon(raw_tx, function_names, amount_stroops, None) {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(
-                        contract = %contract.label,
-                        tx       = %tx_hash,
-                        error    = %e,
-                        "skipping transaction due to enrichment error"
-                    );
-                    continue;
-                }
-            };
+        let enriched = match EnrichedTransaction::from_horizon(record.tx, function_names, amount_stroops, None) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(contract = %contract.label, tx = %tx_hash, error = %e,
+                    "skipping transaction due to enrichment error");
+                continue;
+            }
+        };
 
         tx_count += 1;
 
@@ -377,63 +366,36 @@ async fn poll_contract(
         );
 
         if payloads.is_empty() {
-            debug!(
-                contract = %contract.label,
-                tx       = %tx_hash,
-                rules    = ?contract.rules,
-                "transaction evaluated but no rules matched"
-            );
+            debug!(contract = %contract.label, tx = %tx_hash, rules = ?contract.rules,
+                "transaction evaluated but no rules matched");
         }
 
         for payload in payloads {
             alert_count += 1;
-            // Always log the match; when dry_run is set, do not actually send the webhook.
-            info!(
-                contract = %contract.label,
-                rule     = %payload.rule_triggered,
-                tx       = %payload.transaction_hash,
-                "rule matched"
-            );
+            info!(contract = %contract.label, rule = %payload.rule_triggered,
+                tx = %payload.transaction_hash, "rule matched");
 
             if dry_run {
-                info!(
-                    contract = %contract.label,
-                    rule     = %payload.rule_triggered,
-                    tx       = %payload.transaction_hash,
-                    "dry-run enabled: not sending webhook"
-                );
+                info!(contract = %contract.label, rule = %payload.rule_triggered,
+                    tx = %payload.transaction_hash, "dry-run enabled: not sending webhook");
             } else {
-                info!(
-                    contract = %contract.label,
-                    rule     = %payload.rule_triggered,
-                    tx       = %payload.transaction_hash,
-                    "rule fired — sending webhook"
-                );
+                info!(contract = %contract.label, rule = %payload.rule_triggered,
+                    tx = %payload.transaction_hash, "rule fired — sending webhook");
                 if let Err(e) = send_webhook(
-                    client,
-                    &contract.webhook_url,
-                    &payload,
-                    contract.webhook_secret.as_deref(),
+                    client, &contract.webhook_url, &payload, contract.webhook_secret.as_deref(),
                 ).await {
-                    error!(
-                        contract = %contract.label,
-                        rule     = %payload.rule_triggered,
-                        tx       = %payload.transaction_hash,
-                        error    = %e,
-                        "webhook delivery failed"
-                    );
+                    error!(contract = %contract.label, rule = %payload.rule_triggered,
+                        tx = %payload.transaction_hash, error = %e, "webhook delivery failed");
+                    #[cfg(feature = "metrics")]
+                    metrics::inc_webhook_failures();
                 }
             }
         }
     }
 
     if tx_count > 0 {
-        info!(
-            contract     = %contract.label,
-            transactions = tx_count,
-            alerts       = alert_count,
-            "poll cycle complete"
-        );
+        info!(contract = %contract.label, transactions = tx_count, alerts = alert_count,
+            "poll cycle complete");
     }
 
     Ok((tx_count, alert_count))
@@ -441,28 +403,14 @@ async fn poll_contract(
 
 // ── Soroban operation enrichment ──────────────────────────────────────────────
 
-#[tracing::instrument(skip(client), fields(tx = %tx_hash))]
-async fn fetch_soroban_details(
-    client: &Client,
-    base: &str,
-    tx_hash: &str,
-) -> Result<(Vec<String>, Option<u64>)> {
-    let url = format!("{}/transactions/{}/operations", base, tx_hash);
-
-    let page: OperationsPage = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET {} failed", url))?
-        .json()
-        .await
-        .with_context(|| format!("failed to parse operations from {}", url))?;
-
+/// Extract Soroban details from a slice of already-fetched operations.
+/// Used for both inline (join=operations) and separately-fetched operations.
+fn extract_soroban_details(ops: Vec<HorizonOperation>) -> (Vec<String>, Option<u64>) {
     let mut function_names: Vec<String> = Vec::new();
     let mut total_stroops: u64 = 0;
-    let mut has_payment: bool = false;
+    let mut has_payment = false;
 
-    for op in page._embedded.records {
+    for op in ops {
         if op.op_type == "invoke_host_function" {
             if let Some(f) = op.function {
                 function_names.push(f);
@@ -478,13 +426,29 @@ async fn fetch_soroban_details(
         }
     }
 
-    let amount_stroops = if has_payment {
-        Some(total_stroops)
-    } else {
-        None
-    };
+    (function_names, if has_payment { Some(total_stroops) } else { None })
+}
 
-    Ok((function_names, amount_stroops))
+/// Fetch operations for a single transaction from Horizon.
+/// Used as a fallback when `join=operations` is not supported or returned no ops.
+#[tracing::instrument(skip(client), fields(tx = %tx_hash))]
+async fn fetch_soroban_details(
+    client:  &Client,
+    base:    &str,
+    tx_hash: &str,
+) -> Result<(Vec<String>, Option<u64>)> {
+    let url = format!("{}/transactions/{}/operations", base, tx_hash);
+
+    let page: OperationsPage = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {} failed", url))?
+        .json()
+        .await
+        .with_context(|| format!("failed to parse operations from {}", url))?;
+
+    Ok(extract_soroban_details(page._embedded.records))
 }
 
 // ── Startup log field helpers (for testing) ──────────────────────────────────
@@ -493,27 +457,14 @@ async fn fetch_soroban_details(
 fn startup_log_fields(cfg: &AppConfig) -> (String, String, String, String) {
     let contracts_list = cfg.contracts.iter().map(|c| c.label.as_str()).collect::<Vec<_>>().join(", ");
     let mut networks: Vec<&str> = cfg.contracts.iter().map(|c| c.network.as_str()).collect();
-    networks.sort();
-    networks.dedup();
+    networks.sort(); networks.dedup();
     let networks_str = networks.join(", ");
     let mut horizon_urls: Vec<(&str, &str)> = cfg
-        .contracts
-        .iter()
-        .map(|c| (c.network.as_str(), c.network.horizon_base_url()))
-        .collect();
-    horizon_urls.sort();
-    horizon_urls.dedup();
-    let horizon_urls_str = horizon_urls
-        .iter()
-        .map(|(net, url)| format!("{}={}", net, url))
-        .collect::<Vec<_>>()
-        .join(", ");
-    (
-        env!("CARGO_PKG_VERSION").to_string(),
-        contracts_list,
-        networks_str,
-        horizon_urls_str,
-    )
+        .contracts.iter().map(|c| (c.network.as_str(), c.network.horizon_base_url())).collect();
+    horizon_urls.sort(); horizon_urls.dedup();
+    let horizon_urls_str = horizon_urls.iter()
+        .map(|(net, url)| format!("{}={}", net, url)).collect::<Vec<_>>().join(", ");
+    (env!("CARGO_PKG_VERSION").to_string(), contracts_list, networks_str, horizon_urls_str)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -528,16 +479,83 @@ mod tests {
     fn ops_page(function_name: &str) -> serde_json::Value {
         serde_json::json!({
             "_embedded": {
-                "records": [{
-                    "type":     "invoke_host_function",
-                    "function": function_name
-                }]
+                "records": [{ "type": "invoke_host_function", "function": function_name }]
             }
         })
     }
 
     fn empty_page() -> serde_json::Value {
         serde_json::json!({ "_embedded": { "records": [] } })
+    }
+
+    /// Issue #23: when Horizon returns inline operations via join=operations,
+    /// the poller must parse them correctly without making a separate /operations request.
+    #[tokio::test]
+    async fn inline_operations_parsed_correctly() {
+        let server = MockServer::start().await;
+
+        // Transactions page with inline operations (join=operations response shape)
+        let tx_with_ops = serde_json::json!({
+            "_embedded": {
+                "records": [{
+                    "hash":         "inlinetx1",
+                    "created_at":   "2024-06-01T10:00:00Z",
+                    "successful":   true,
+                    "paging_token": "1",
+                    "fee_charged":  "100",
+                    "envelope_xdr": null,
+                    "result_xdr":   null,
+                    "operations": [
+                        { "type": "invoke_host_function", "function": "withdraw" }
+                    ]
+                }]
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(tx_with_ops))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Subsequent requests return empty page
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_page()))
+            .mount(&server)
+            .await;
+
+        // Webhook receiver
+        let receiver = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&receiver)
+            .await;
+
+        let client = Client::new();
+        let contract = WatchedContract {
+            label:       "test".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            network:     Network::Testnet,
+            rules:       vec![AlertRule::FunctionCalled { function_name: "withdraw".into() }],
+            webhook_url: format!("{}/hook", receiver.uri()),
+            webhook_secret: None,
+            horizon_base_url_override: Some(server.uri()),
+        };
+        let mut cursors: HashMap<String, String> = HashMap::new();
+        cursors.insert(contract.contract_id.clone(), "now".to_string());
+
+        let (txs, alerts) = poll_contract(&client, &contract, &mut cursors, false).await.unwrap();
+        assert_eq!(txs, 1);
+        assert_eq!(alerts, 1, "FunctionCalled(withdraw) should fire from inline operations");
+
+        // Verify no /operations request was made (inline ops used instead)
+        let reqs = server.received_requests().await.unwrap();
+        assert!(
+            reqs.iter().all(|r| !r.url.path().contains("/operations")),
+            "no separate /operations request should be made when inline ops are present"
+        );
     }
 
     #[tokio::test]
@@ -549,9 +567,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = txwatch_notifier::build_client().unwrap();
+        let client = Client::new();
         let url = format!(
-            "{}/accounts/{}/transactions?cursor=now&order=asc&limit=200",
+            "{}/accounts/{}/transactions?cursor=now&order=asc&limit=200&join=operations",
             server.uri(),
             "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         );
@@ -568,7 +586,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = txwatch_notifier::build_client().unwrap();
+        let client = Client::new();
         let (fn_names, amount) =
             fetch_soroban_details(&client, &server.uri(), "abc123").await.unwrap();
 
@@ -588,7 +606,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = txwatch_notifier::build_client().unwrap();
+        let client = Client::new();
         let (fn_names, amount) =
             fetch_soroban_details(&client, &server.uri(), "abc123").await.unwrap();
 
@@ -606,12 +624,70 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = txwatch_notifier::build_client().unwrap();
+        let client = Client::new();
         let (fn_names, amount) =
             fetch_soroban_details(&client, &server.uri(), "abc123").await.unwrap();
 
         assert!(fn_names.is_empty());
         assert!(amount.is_none());
+    }
+
+    #[tokio::test]
+    async fn horizon_429_returns_meaningful_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let mut cursors: HashMap<String, String> = HashMap::new();
+        cursors.insert(contract_id.to_string(), "now".to_string());
+
+        let contract = WatchedContract {
+            label: "test".into(),
+            contract_id: contract_id.into(),
+            network: Network::Testnet,
+            webhook_url: "https://hooks.example.com/test".into(),
+            webhook_secret: None,
+            horizon_base_url_override: Some(server.uri()),
+        };
+
+        // 429 is handled with a back-off and returns Ok((0,0)), not an error
+        let result = poll_contract(&client, &contract, &mut cursors).await;
+        assert!(result.is_ok(), "429 should return Ok after back-off");
+        assert_eq!(result.unwrap(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn horizon_503_error_contains_status_code() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let mut cursors: HashMap<String, String> = HashMap::new();
+        cursors.insert(contract_id.to_string(), "now".to_string());
+
+        let contract = WatchedContract {
+            label: "test".into(),
+            contract_id: contract_id.into(),
+            network: Network::Testnet,
+            webhook_url: "https://hooks.example.com/test".into(),
+            webhook_secret: None,
+            horizon_base_url_override: Some(server.uri()),
+        };
+
+        let err = poll_contract(&client, &contract, &mut cursors).await.unwrap_err();
+            err.to_string().contains("503"),
+            "error must contain HTTP status 503, got: {}", err
+        );
     }
 
     #[tokio::test]
@@ -638,7 +714,7 @@ mod tests {
             horizon_base_url_override: Some(server.uri()),
         };
 
-        let result = poll_contract(&client, &contract, &mut cursors).await;
+        let result = poll_contract(&client, &contract, &mut cursors, false).await;
         assert!(result.is_err(), "expected Err when Horizon returns 500");
         assert_eq!(
             cursors.get(contract_id).map(String::as_str),
@@ -656,28 +732,28 @@ mod tests {
             http_connection_verbose: None,
             contracts: vec![
                 WatchedContract {
-                    label:      "Contract A".into(),
+                    label:       "Contract A".into(),
                     contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
-                    network:    txwatch_config::Network::Testnet,
-                    rules:      vec![txwatch_config::AlertRule::AnyTransaction],
+                    network:     txwatch_config::Network::Testnet,
+                    rules:       vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/a".into(),
                     webhook_secret: None,
                     horizon_base_url_override: None,
                 },
                 WatchedContract {
-                    label:      "Contract B".into(),
+                    label:       "Contract B".into(),
                     contract_id: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into(),
-                    network:    txwatch_config::Network::Mainnet,
-                    rules:      vec![txwatch_config::AlertRule::AnyTransaction],
+                    network:     txwatch_config::Network::Mainnet,
+                    rules:       vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/b".into(),
                     webhook_secret: None,
                     horizon_base_url_override: None,
                 },
                 WatchedContract {
-                    label:      "Contract C".into(),
+                    label:       "Contract C".into(),
                     contract_id: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC".into(),
-                    network:    txwatch_config::Network::Mainnet,
-                    rules:      vec![txwatch_config::AlertRule::AnyTransaction],
+                    network:     txwatch_config::Network::Mainnet,
+                    rules:       vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/c".into(),
                     webhook_secret: None,
                     horizon_base_url_override: None,
@@ -686,24 +762,19 @@ mod tests {
         };
 
         let (version, contracts_list, networks, horizon_urls) = startup_log_fields(&cfg);
-
         assert!(!version.is_empty());
         assert_eq!(contracts_list, "Contract A, Contract B, Contract C");
         assert_eq!(networks, "mainnet, testnet");
-        // Issue #114: horizon URLs must include network name and URL for each distinct network
         assert!(horizon_urls.contains("mainnet=https://horizon.stellar.org"));
         assert!(horizon_urls.contains("testnet=https://horizon-testnet.stellar.org"));
     }
 
     #[tokio::test]
     async fn poll_handles_pagination_two_pages() {
-        use std::collections::HashMap;
-
         let server = MockServer::start().await;
 
-        // Build first page with 200 transactions
         let mut records1 = Vec::new();
-        for i in 1..=200 {
+        for i in 1..=200u64 {
             records1.push(serde_json::json!({
                 "hash": format!("tx{}", i),
                 "created_at": "2020-01-01T00:00:00Z",
@@ -712,26 +783,23 @@ mod tests {
             }));
         }
         let page1 = serde_json::json!({ "_embedded": { "records": records1 }});
-
-        // Second page with one transaction
         let page2 = serde_json::json!({ "_embedded": { "records": [
             { "hash": "tx201", "created_at": "2020-01-01T00:00:01Z", "successful": true, "paging_token": "201" }
         ] }});
 
-        // Mount mocks in sequence: first GET -> page1, second GET -> page2
         Mock::given(method("GET"))
             .and(path_regex("/accounts/.*/transactions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(page1))
+            .up_to_n_times(1)
             .mount(&server)
             .await;
-
         Mock::given(method("GET"))
             .and(path_regex("/accounts/.*/transactions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(page2))
             .mount(&server)
             .await;
 
-        // Operations endpoint: return empty ops for every tx
+        // Fallback /operations endpoint for transactions without inline ops
         Mock::given(method("GET"))
             .and(path_regex("/transactions/.*/operations"))
             .respond_with(ResponseTemplate::new(200).set_body_json(empty_page()))
@@ -739,20 +807,19 @@ mod tests {
             .await;
 
         let client = Client::new();
-        let mut contract = WatchedContract {
-            label: "Contract".into(),
+        let contract = WatchedContract {
+            label:       "Contract".into(),
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
-            network: Network::Testnet,
-            rules: vec![AlertRule::AnyTransaction],
+            network:     Network::Testnet,
+            rules:       vec![AlertRule::AnyTransaction],
             webhook_url: format!("{}/hooks", server.uri()),
             webhook_secret: None,
             horizon_base_url_override: Some(server.uri()),
         };
-
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
 
-        let (txs, alerts) = poll_contract(&client, &contract, &mut cursors).await.unwrap();
+        let (txs, alerts) = poll_contract(&client, &contract, &mut cursors, false).await.unwrap();
         assert_eq!(txs, 201);
         assert_eq!(alerts, 201);
     }
