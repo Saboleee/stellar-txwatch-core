@@ -240,7 +240,10 @@ async fn poll_contract(
         return Ok((0, 0));
     }
 
+    let status = response.status();
     let page: HorizonPage = response
+        .error_for_status()
+        .with_context(|| format!("Horizon returned HTTP {} for {}", status, url))?
         .json()
         .await
         .with_context(|| format!("failed to parse Horizon response from {}", url))?;
@@ -407,11 +410,15 @@ async fn fetch_soroban_details(
 ) -> Result<(Vec<String>, Option<u64>)> {
     let url = format!("{}/transactions/{}/operations", base, tx_hash);
 
-    let page: OperationsPage = client
+    let resp = client
         .get(&url)
         .send()
         .await
-        .with_context(|| format!("GET {} failed", url))?
+        .with_context(|| format!("GET {} failed", url))?;
+    let ops_status = resp.status();
+    let page: OperationsPage = resp
+        .error_for_status()
+        .with_context(|| format!("Horizon returned HTTP {} for {}", ops_status, url))?
         .json()
         .await
         .with_context(|| format!("failed to parse operations from {}", url))?;
@@ -570,6 +577,64 @@ mod tests {
 
         assert!(fn_names.is_empty());
         assert!(amount.is_none());
+    }
+
+    #[tokio::test]
+    async fn horizon_429_returns_meaningful_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let mut cursors: HashMap<String, String> = HashMap::new();
+        cursors.insert(contract_id.to_string(), "now".to_string());
+
+        let contract = WatchedContract {
+            label: "test".into(),
+            contract_id: contract_id.into(),
+            network: Network::Testnet,
+            webhook_url: "https://hooks.example.com/test".into(),
+            webhook_secret: None,
+            horizon_base_url_override: Some(server.uri()),
+        };
+
+        // 429 is handled with a back-off and returns Ok((0,0)), not an error
+        let result = poll_contract(&client, &contract, &mut cursors).await;
+        assert!(result.is_ok(), "429 should return Ok after back-off");
+        assert_eq!(result.unwrap(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn horizon_503_error_contains_status_code() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let mut cursors: HashMap<String, String> = HashMap::new();
+        cursors.insert(contract_id.to_string(), "now".to_string());
+
+        let contract = WatchedContract {
+            label: "test".into(),
+            contract_id: contract_id.into(),
+            network: Network::Testnet,
+            webhook_url: "https://hooks.example.com/test".into(),
+            webhook_secret: None,
+            horizon_base_url_override: Some(server.uri()),
+        };
+
+        let err = poll_contract(&client, &contract, &mut cursors).await.unwrap_err();
+            err.to_string().contains("503"),
+            "error must contain HTTP status 503, got: {}", err
+        );
     }
 
     #[tokio::test]

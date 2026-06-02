@@ -197,7 +197,7 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
 - `Content-Type: application/json`
 - `Content-Length: <length of JSON body in bytes>`
 - `X-TxWatch-Version: <package version>`
-- `X-TxWatch-Secret: <secret>` (optional, only when configured)
+- `X-TxWatch-Signature: sha256=<hmac>` (optional, only when `webhook_secret` is configured — HMAC-SHA256 of the request body)
 
 **Fields:**
 - `rule_type` — stable machine-readable rule variant (e.g. `"LargeTransfer"`, `"HighFee"`); use this for programmatic routing

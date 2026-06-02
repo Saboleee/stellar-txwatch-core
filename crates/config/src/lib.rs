@@ -316,8 +316,8 @@ impl AppConfig {
     }
 
     pub fn validate(&mut self) -> Result<()> {
-        if self.poll_interval_seconds == 0 {
-            bail!("poll_interval_seconds must be > 0");
+        if self.poll_interval_seconds < 5 {
+            bail!("poll_interval_seconds must be >= 5");
         }
         if self.poll_interval_seconds > 3600 {
             bail!("poll_interval_seconds must be <= 3600 (1 hour)");
@@ -565,6 +565,22 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![AlertRule::HighFee { threshold_stroops: 0, threshold_xlm: None }];
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_poll_interval_too_low() {
+        for val in 0u64..5 {
+            let mut cfg = AppConfig {
+                poll_interval_seconds: val,
+                http_pool_max_idle_per_host: None,
+                http_tcp_keepalive_secs: None,
+                http_connection_verbose: None,
+            };
+            let err = cfg.validate().unwrap_err();
+                err.to_string().contains("poll_interval_seconds must be >= 5"),
+                "val={} should be rejected: {}", val, err
+            );
+        }
     }
 
     #[test]
