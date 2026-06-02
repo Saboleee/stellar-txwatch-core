@@ -61,12 +61,23 @@ struct Counters {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/// Run the polling loop forever. Each contract is polled concurrently via a
-/// tokio JoinSet; one slow or failing contract never blocks the others.
-/// Logs a summary every 60 seconds: contracts watched, transactions processed,
-/// alerts fired.
 /// Backwards-compatible wrapper: default (non-dry) run
 pub async fn run(cfg: AppConfig) -> Result<()> {
+    run_with(cfg, false).await
+}
+
+/// Run the polling loop forever with dry-run support.
+pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    run_with_shutdown(cfg, dry_run, shutdown_rx).await
+}
+
+/// Run the polling loop forever and stop cleanly when the shutdown token is set.
+pub async fn run_with_shutdown(
+    cfg: AppConfig,
+    dry_run: bool,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     // Build HTTP client: start from the shared base configuration (timeout, etc.)
     // then apply pool-tuning options from the app config.
     let max_idle       = cfg.http_pool_max_idle_per_host.unwrap_or(10);
@@ -162,9 +173,6 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
     });
 
     loop {
-        let mut set: tokio::task::JoinSet<(String, String, Result<(u64, u64)>)> =
-            tokio::task::JoinSet::new();
-
         for contract in &cfg.contracts {
             match poll_contract(&client, contract, &mut cursors, dry_run).await {
                 Ok((txs, alerts)) => {
@@ -183,8 +191,24 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
             }
         }
 
-        tokio::time::sleep(interval).await;
+        if *shutdown_rx.borrow() {
+            info!("shutdown signal received; exiting after current poll cycle");
+            break;
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {},
+            changed = shutdown_rx.changed() => {
+                if changed.is_ok() && *shutdown_rx.borrow() {
+                    info!("shutdown signal received; exiting after current poll cycle");
+                    break;
+                }
+            }
+        }
     }
+
+    info!("TxWatch polling engine stopped cleanly");
+    Ok(())
 }
 
 // ── Per-contract poll ─────────────────────────────────────────────────────────
@@ -218,33 +242,44 @@ async fn poll_contract(
         .as_deref()
         .unwrap_or_else(|| contract.network.horizon_base_url());
 
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET {} failed", url))?;
+    let canonical_base = contract.network.horizon_base_url();
+    let mut page_cursor = cursor.clone();
+    let mut all_records: Vec<HorizonTransaction> = Vec::new();
 
-    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        let retry_after = response
-            .headers()
-            .get("Retry-After")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(5);
-        warn!(
-            contract     = %contract.label,
-            retry_after  = retry_after,
-            "Horizon returned 429 — backing off"
+    loop {
+        let url = format!(
+            "{}/accounts/{}/transactions?cursor={}&order=asc&limit=200",
+            poll_base, contract.contract_id, page_cursor
         );
-        tokio::time::sleep(Duration::from_secs(retry_after)).await;
-        return Ok((0, 0));
-    }
 
-    let page: HorizonPage = response
-        .json()
-        .await
-        .with_context(|| format!("failed to parse Horizon response from {}", url))?;
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {} failed", url))?;
 
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = response
+                .headers()
+                .get("Retry-After")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(5);
+            warn!(
+                contract     = %contract.label,
+                retry_after  = retry_after,
+                "Horizon returned 429 — backing off"
+            );
+            tokio::time::sleep(Duration::from_secs(retry_after)).await;
+            return Ok((0, 0));
+        }
+
+        let page: HorizonPage = response
+            .json()
+            .await
+            .with_context(|| format!("failed to parse Horizon response from {}", url))?;
+
+        let records = page._embedded.records;
         if records.is_empty() {
             break;
         }
@@ -253,13 +288,10 @@ async fn poll_contract(
             all_records.push(r.clone());
         }
 
-        // If this page had fewer than the max (200), it is the last page.
-        if all_records.len() % 200 != 0 || records.len() < 200 {
+        if records.len() < 200 {
             break;
         }
 
-        // Advance the cursor to the last paging_token so the next request returns
-        // records after the last one we just processed.
         if let Some(last) = all_records.last() {
             page_cursor = last.paging_token.clone();
         } else {
