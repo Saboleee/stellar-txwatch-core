@@ -51,6 +51,8 @@ enum Command {
     },
 
     /// Send a test webhook payload to a URL and exit
+    ///
+    /// Exit codes: 0 = webhook delivered, 1 = delivery failed (unreachable or HTTP error)
     TestWebhook {
         /// The webhook URL to POST to
         #[arg(long)]
