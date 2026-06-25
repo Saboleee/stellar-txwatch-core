@@ -138,6 +138,22 @@ The project uses [wiremock](https://crates.io/crates/wiremock) to mock HTTP endp
 
 ---
 
+## Dependency lock files
+
+`Cargo.lock` is committed to this repository. This workspace contains both
+a binary crate (`crates/cli`) and library crates, and we commit the lock
+file to ensure reproducible builds of the binary.
+
+**When submitting a pull request:**
+
+- If you update dependencies (directly or indirectly), commit the updated `Cargo.lock`
+- Use `cargo update` to update dependencies, then commit the resulting lock file
+- Do not remove or exclude `Cargo.lock` from commits
+
+This ensures all contributors and CI builds use the exact same dependency versions.
+
+---
+
 ## How to add a new `AlertRule` type
 
 Follow these steps in order. Each step is in a different file.
@@ -174,6 +190,10 @@ AlertRule::MyNewRule { my_field } => {
     Ok(tx.function_name.as_deref() == Some(my_field.as_str()))
 }
 ```
+
+> Note: Adding a new `AlertRule` variant requires updating both `eval_rule()` and
+> `rule_label()` in `crates/rules/src/lib.rs`. Rust's exhaustive matching helps
+> catch missing arms, but both functions must remain in sync for new variants.
 
 ### Step 4 — Label the rule (`crates/rules/src/lib.rs`)
 
