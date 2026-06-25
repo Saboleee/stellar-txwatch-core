@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     sync::atomic::{AtomicU64, Ordering},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -11,7 +11,7 @@ use serde::Deserialize;
 use tracing::{error, info, warn};
 use txwatch_config::{AppConfig, WatchedContract};
 use txwatch_notifier::send_webhook;
-use txwatch_rules::{evaluate, EnrichedTransaction, HorizonTransaction};
+use txwatch_rules::{EnrichedTransaction, HorizonTransaction};
 
 // ── Horizon response shapes ───────────────────────────────────────────────────
 
@@ -78,6 +78,10 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
         .map(|c| (c.contract_id.clone(), "now".to_string()))
         .collect();
 
+    // Cooldown state: keyed by (contract_label, rule_index).
+    // Not persisted across restarts — an accepted tradeoff for simplicity.
+    let mut rule_cooldowns: HashMap<(String, usize), Instant> = HashMap::new();
+
     let interval      = Duration::from_secs(cfg.poll_interval_seconds);
     let summary_every = Duration::from_secs(60);
     let counters      = Arc::new(Counters::default());
@@ -114,7 +118,7 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
 
     loop {
         for contract in &cfg.contracts {
-            match poll_contract(&client, contract, &mut cursors).await {
+            match poll_contract(&client, contract, &mut cursors, &mut rule_cooldowns).await {
                 Ok((txs, alerts)) => {
                     counters.transactions.fetch_add(txs, Ordering::Relaxed);
                     counters.alerts.fetch_add(alerts, Ordering::Relaxed);
@@ -139,6 +143,7 @@ async fn poll_contract(
     client:   &Client,
     contract: &WatchedContract,
     cursors:  &mut HashMap<String, String>,
+    rule_cooldowns: &mut HashMap<(String, usize), Instant>,
 ) -> Result<(u64, u64)> {
     let cursor = cursors
         .get(&contract.contract_id)
@@ -208,22 +213,62 @@ async fn poll_contract(
 
         tx_count += 1;
 
-        let payloads = evaluate(
-            &contract.label,
-            &contract.contract_id,
-            contract.network.as_str(),
-            base,
-            contract.network.explorer_base_url(),
-            &contract.rules,
-            &enriched,
-        );
+        let horizon_link = format!("{}/transactions/{}", base, enriched.hash);
+        let explorer_link = format!("{}/tx/{}", contract.network.explorer_base_url(), enriched.hash);
+        let timestamp = enriched.timestamp.timestamp();
 
-        for payload in payloads {
+        for (rule_index, rule_config) in contract.rules.iter().enumerate() {
+            let cooldown_key = (contract.label.clone(), rule_index);
+
+            // Check if this rule is within its cooldown window. If so, skip evaluation.
+            if let Some(cooldown_secs) = rule_config.cooldown_seconds {
+                if let Some(last_fired) = rule_cooldowns.get(&cooldown_key) {
+                    if last_fired.elapsed() < Duration::from_secs(cooldown_secs) {
+                        continue;
+                    }
+                }
+            }
+
+            // Evaluate the rule.
+            let rule_fired = match txwatch_rules::eval_rule(&rule_config.rule, &enriched) {
+                Ok(fired) => fired,
+                Err(e) => {
+                    warn!(
+                        contract = %contract.label,
+                        tx       = %enriched.hash,
+                        rule     = ?rule_index,
+                        error    = %e,
+                        "rule evaluation error — skipping"
+                    );
+                    continue;
+                }
+            };
+
+            if !rule_fired {
+                continue;
+            }
+
+            // Rule fired — send webhook.
+            let rule_label = txwatch_rules::rule_label(&rule_config.rule);
+            let payload = txwatch_rules::AlertPayload {
+                label:            contract.label.clone(),
+                contract_id:      contract.contract_id.clone(),
+                network:          contract.network.as_str().to_string(),
+                rule_triggered:   rule_label.clone(),
+                transaction_hash: enriched.hash.clone(),
+                function_name:    enriched.function_name.clone(),
+                amount_xlm:       enriched.amount_stroops.map(|s| s / 10_000_000),
+                fee_charged_stroops: enriched.fee_charged_stroops,
+                timestamp,
+                horizon_link:     horizon_link.clone(),
+                explorer_link:    explorer_link.clone(),
+            };
+
             alert_count += 1;
             info!(
                 contract = %contract.label,
-                rule     = %payload.rule_triggered,
-                tx       = %payload.transaction_hash,
+                rule     = %rule_label,
+                tx       = %enriched.hash,
                 "rule fired — sending webhook"
             );
             if let Err(e) = send_webhook(
@@ -234,11 +279,14 @@ async fn poll_contract(
             ).await {
                 error!(
                     contract = %contract.label,
-                    rule     = %payload.rule_triggered,
-                    tx       = %payload.transaction_hash,
+                    rule     = %rule_label,
+                    tx       = %enriched.hash,
                     error    = %e,
                     "webhook delivery failed"
                 );
+            } else {
+                // Update the last-fired timestamp for this rule.
+                rule_cooldowns.insert(cooldown_key, Instant::now());
             }
         }
     }
@@ -424,7 +472,7 @@ mod tests {
                     label: "Contract A".into(),
                     contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
                     network: txwatch_config::Network::Testnet,
-                    rules: vec![txwatch_config::AlertRule::AnyTransaction],
+                    rules: vec![txwatch_config::RuleConfig { rule: txwatch_config::AlertRule::AnyTransaction, cooldown_seconds: None }],
                     webhook_url: "https://hooks.example.com/a".into(),
                     webhook_secret: None,
                 },
@@ -432,7 +480,7 @@ mod tests {
                     label: "Contract B".into(),
                     contract_id: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into(),
                     network: txwatch_config::Network::Mainnet,
-                    rules: vec![txwatch_config::AlertRule::AnyTransaction],
+                    rules: vec![txwatch_config::RuleConfig { rule: txwatch_config::AlertRule::AnyTransaction, cooldown_seconds: None }],
                     webhook_url: "https://hooks.example.com/b".into(),
                     webhook_secret: None,
                 },
@@ -440,11 +488,14 @@ mod tests {
                     label: "Contract C".into(),
                     contract_id: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC".into(),
                     network: txwatch_config::Network::Mainnet,
-                    rules: vec![txwatch_config::AlertRule::AnyTransaction],
+                    rules: vec![txwatch_config::RuleConfig { rule: txwatch_config::AlertRule::AnyTransaction, cooldown_seconds: None }],
                     webhook_url: "https://hooks.example.com/c".into(),
                     webhook_secret: None,
                 },
             ],
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
         };
 
         let (version, contracts_list, networks) = startup_log_fields(&cfg);

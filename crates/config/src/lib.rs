@@ -68,6 +68,13 @@ pub enum AlertRule {
     HighFee             { threshold_stroops: u64 },
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct RuleConfig {
+    #[serde(flatten)]
+    pub rule: AlertRule,
+    pub cooldown_seconds: Option<u64>,
+}
+
 impl AlertRule {
     pub fn validate(&self, contract_label: &str) -> Result<()> {
         match self {
@@ -117,6 +124,21 @@ impl AlertRule {
     }
 }
 
+impl RuleConfig {
+    pub fn validate(&self, contract_label: &str) -> Result<()> {
+        self.rule.validate(contract_label)?;
+        if let Some(cooldown) = self.cooldown_seconds {
+            if cooldown == 0 {
+                bail!(
+                    "contract '{}': cooldown_seconds must be > 0 if set",
+                    contract_label
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 // ── WatchedContract ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -124,7 +146,7 @@ pub struct WatchedContract {
     pub label:       String,
     pub contract_id: String,
     pub network:     Network,
-    pub rules:       Vec<AlertRule>,
+    pub rules:       Vec<RuleConfig>,
     pub webhook_url: String,
     /// Optional secret sent as X-TxWatch-Secret header on every webhook POST.
     pub webhook_secret: Option<String>,
@@ -158,8 +180,8 @@ impl WatchedContract {
             bail!("contract '{}': at least one rule is required", self.label);
         }
 
-        for rule in &self.rules {
-            rule.validate(&self.label)?;
+        for rule_config in &self.rules {
+            rule_config.validate(&self.label)?;
         }
 
         Ok(())
@@ -241,7 +263,7 @@ mod tests {
             label:          "Test".into(),
             contract_id:    "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
             network:        Network::Testnet,
-            rules:          vec![AlertRule::AnyTransaction],
+            rules:          vec![RuleConfig { rule: AlertRule::AnyTransaction, cooldown_seconds: None }],
             webhook_url:    "https://example.com/hook".into(),
             webhook_secret: None,
         }
@@ -284,21 +306,21 @@ mod tests {
     #[test]
     fn rejects_zero_threshold() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::LargeTransfer { threshold_xlm: 0 }];
+        c.rules = vec![RuleConfig { rule: AlertRule::LargeTransfer { threshold_xlm: 0 }, cooldown_seconds: None }];
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn rejects_empty_function_name() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::FunctionCalled { function_name: "  ".into() }];
+        c.rules = vec![RuleConfig { rule: AlertRule::FunctionCalled { function_name: "  ".into() }, cooldown_seconds: None }];
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn rejects_empty_admin_function_names() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::AdminFunctionCalled { function_names: vec![] }];
+        c.rules = vec![RuleConfig { rule: AlertRule::AdminFunctionCalled { function_names: vec![] }, cooldown_seconds: None }];
         assert!(c.validate().is_err());
     }
 
@@ -328,6 +350,9 @@ mod tests {
         let cfg = AppConfig {
             poll_interval_seconds: 10,
             contracts: vec![c.clone(), c],
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("duplicate contract label"));
@@ -347,6 +372,30 @@ mod tests {
         "#;
         let cfg: AppConfig = toml::from_str(raw).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_cooldown_seconds() {
+        let mut c = valid_contract();
+        c.rules = vec![RuleConfig { rule: AlertRule::AnyTransaction, cooldown_seconds: Some(0) }];
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_nonzero_cooldown_seconds() {
+        let mut c = valid_contract();
+        c.rules = vec![RuleConfig { rule: AlertRule::AnyTransaction, cooldown_seconds: Some(60) }];
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn accepts_cooldown_on_any_rule_type() {
+        let mut c = valid_contract();
+        c.rules = vec![
+            RuleConfig { rule: AlertRule::TransactionFailed, cooldown_seconds: Some(120) },
+            RuleConfig { rule: AlertRule::LargeTransfer { threshold_xlm: 100 }, cooldown_seconds: Some(300) },
+        ];
+        assert!(c.validate().is_ok());
     }
 
     #[test]

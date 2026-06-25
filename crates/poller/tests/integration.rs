@@ -14,20 +14,24 @@ use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // Re-export internal helpers via the public API surface we test.
-use txwatch_config::{AlertRule, Network, WatchedContract};
+use txwatch_config::{AlertRule, Network, RuleConfig, WatchedContract};
 use txwatch_rules::{evaluate, EnrichedTransaction};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn contract(webhook_url: &str, rules: Vec<AlertRule>) -> WatchedContract {
+fn contract(webhook_url: &str, rule_configs: Vec<RuleConfig>) -> WatchedContract {
     WatchedContract {
         label:       "Integration Test Contract".into(),
         contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
         network:     Network::Testnet,
-        rules,
+        rules:       rule_configs,
         webhook_url: webhook_url.to_string(),
         webhook_secret: None,
     }
+}
+
+fn extract_alert_rules(rule_configs: &[RuleConfig]) -> Vec<AlertRule> {
+    rule_configs.iter().map(|rc| rc.rule.clone()).collect()
 }
 
 fn tx_page_json(
@@ -112,7 +116,7 @@ async fn any_transaction_fires_webhook() {
 
     // Run one poll cycle manually.
     let client   = Client::new();
-    let contract = contract(&format!("{}/hook", receiver.uri()), vec![AlertRule::AnyTransaction]);
+    let contract = contract(&format!("{}/hook", receiver.uri()), vec![RuleConfig { rule: AlertRule::AnyTransaction, cooldown_seconds: None }]);
 
     let url = format!(
         "{}/accounts/{}/transactions?cursor=now&order=asc&limit=200",
@@ -139,13 +143,14 @@ async fn any_transaction_fires_webhook() {
         let _ops: OpsPage = client.get(&ops_url).send().await.unwrap().json().await.unwrap();
 
         let enriched = EnrichedTransaction::from_horizon(raw, None, None, None).unwrap();
+        let alert_rules = extract_alert_rules(&contract.rules);
         let payloads = evaluate(
             &contract.label,
             &contract.contract_id,
             contract.network.as_str(),
             &horizon.uri(),
         "https://stellar.expert/explorer/testnet",
-            &contract.rules,
+            &alert_rules,
             &enriched,
         );
         assert_eq!(payloads.len(), 1);
@@ -199,7 +204,7 @@ async fn transaction_failed_rule_fires_only_on_failure() {
     let client   = Client::new();
     let contract = contract(
         &format!("{}/hook", receiver.uri()),
-        vec![AlertRule::TransactionFailed],
+        vec![RuleConfig { rule: AlertRule::TransactionFailed, cooldown_seconds: None }],
     );
 
     let txs = vec![
@@ -226,7 +231,7 @@ async fn transaction_failed_rule_fires_only_on_failure() {
             &contract.label, &contract.contract_id,
             contract.network.as_str(), &horizon.uri(),
         "https://stellar.expert/explorer/testnet",
-            &contract.rules, tx,
+            &extract_alert_rules(&contract.rules), tx,
         );
         for p in &payloads {
             txwatch_notifier::send_webhook(&client, &contract.webhook_url, p, None)
@@ -249,7 +254,7 @@ async fn large_transfer_fires_above_threshold() {
     let client   = Client::new();
     let contract = contract(
         &format!("{}/hook", receiver.uri()),
-        vec![AlertRule::LargeTransfer { threshold_xlm: 5_000 }],
+        vec![RuleConfig { rule: AlertRule::LargeTransfer { threshold_xlm: 5_000 }, cooldown_seconds: None }],
     );
 
     // 10_000 XLM = 100_000_000_000 stroops — above threshold
@@ -268,7 +273,7 @@ async fn large_transfer_fires_above_threshold() {
         &contract.label, &contract.contract_id,
         contract.network.as_str(), "https://horizon-testnet.stellar.org",
         "https://stellar.expert/explorer/testnet",
-        &contract.rules, &tx,
+        &extract_alert_rules(&contract.rules), &tx,
     );
     assert_eq!(payloads.len(), 1);
     assert_eq!(payloads[0].amount_xlm, Some(10_000));
@@ -291,7 +296,7 @@ async fn function_called_rule_fires_on_exact_match() {
     let client   = Client::new();
     let contract = contract(
         &format!("{}/hook", receiver.uri()),
-        vec![AlertRule::FunctionCalled { function_name: "withdraw".into() }],
+        vec![RuleConfig { rule: AlertRule::FunctionCalled { function_name: "withdraw".into() }, cooldown_seconds: None }],
     );
 
     let txs = vec![
@@ -320,7 +325,7 @@ async fn function_called_rule_fires_on_exact_match() {
             &contract.label, &contract.contract_id,
             contract.network.as_str(), "https://horizon-testnet.stellar.org",
         "https://stellar.expert/explorer/testnet",
-            &contract.rules, tx,
+            &extract_alert_rules(&contract.rules), tx,
         );
         for p in &payloads {
             txwatch_notifier::send_webhook(&client, &contract.webhook_url, p, None)
@@ -393,7 +398,7 @@ async fn high_fee_rule_fires_on_fee_charged() {
     let client   = Client::new();
     let contract = contract(
         &format!("{}/hook", receiver.uri()),
-        vec![AlertRule::HighFee { threshold_stroops: 10_000 }],
+        vec![RuleConfig { rule: AlertRule::HighFee { threshold_stroops: 10_000 }, cooldown_seconds: None }],
     );
 
     let tx = EnrichedTransaction::from_horizon(
@@ -417,7 +422,7 @@ async fn high_fee_rule_fires_on_fee_charged() {
         contract.network.as_str(),
         &horizon.uri(),
         "https://stellar.expert/explorer/testnet",
-        &contract.rules,
+        &extract_alert_rules(&contract.rules),
         &tx,
     );
     assert_eq!(payloads.len(), 1);

@@ -91,6 +91,28 @@ type               = "HighFee"
 threshold_stroops  = 100000
 ```
 
+### `AlertCooldown` modifier
+
+| Field              | Type   | Required | Description                              |
+|--------------------|--------|----------|------------------------------------------|
+| `cooldown_seconds` | u64    | no       | Minimum seconds between alerts for this rule (> 0 if set) |
+
+The `cooldown_seconds` field can be added to any rule to suppress repeated alerts within a cooldown window.
+Once a rule fires and a webhook is successfully sent, subsequent matches within the cooldown window are skipped.
+After the cooldown window expires, the rule fires normally again.
+
+**Tradeoff:** Cooldown state is not persisted across service restarts. The cooldown window resets when the service starts.
+This is an accepted tradeoff for simplicity; persistent state would require a database or local storage.
+
+**Use case:** Reduce alert spam for noisy conditions (e.g., a contract in a failed state that repeatedly triggers alerts).
+
+```toml
+[[contracts.rules]]
+type                = "LargeTransfer"
+threshold_xlm       = 10000
+cooldown_seconds    = 3600  # Alert at most once per hour
+```
+
 ## Evaluation order
 
 Rules are evaluated in the order they appear in the config file.

@@ -83,12 +83,10 @@ pub async fn send_webhook(
 /// Build a synthetic `AlertPayload` suitable for `test-webhook`.
 /// Uses the provided network name and horizon base URL, falling back to testnet defaults if not provided.
 pub fn test_payload(label: &str, webhook_url: &str) -> AlertPayload {
-    let now = Utc::now();
     AlertPayload {
         label:            label.to_string(),
         contract_id:      "CTEST000000000000000000000000000000000000000000000000000".into(),
         network:          "testnet".into(),
-        rule_type:        "TestWebhook".into(),
         rule_triggered:   "TestWebhook".into(),
         transaction_hash: "0000000000000000000000000000000000000000000000000000000000000000".into(),
         function_name:    Some("test".into()),
@@ -100,6 +98,24 @@ pub fn test_payload(label: &str, webhook_url: &str) -> AlertPayload {
     }
     // suppress unused webhook_url warning — callers use it to POST
     // but we include it in the payload label for clarity
+    .with_label(format!("{} (test-webhook to {})", label, webhook_url))
+}
+
+pub fn test_payload_with_network(label: &str, webhook_url: &str, network: &str, horizon_base: &str) -> AlertPayload {
+    let tx_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+    AlertPayload {
+        label:            label.to_string(),
+        contract_id:      "CTEST000000000000000000000000000000000000000000000000000".into(),
+        network:          network.to_string(),
+        rule_triggered:   "TestWebhook".into(),
+        transaction_hash: tx_hash.into(),
+        function_name:    Some("test".into()),
+        amount_xlm:       None,
+        fee_charged_stroops: None,
+        timestamp:        Utc::now().timestamp(),
+        horizon_link:     format!("{}/transactions/{}", horizon_base, tx_hash),
+        explorer_link:    "https://stellar.expert/explorer/testnet/tx/0000000000000000000000000000000000000000000000000000000000000000".into(),
+    }
     .with_label(format!("{} (test-webhook to {})", label, webhook_url))
 }
 
@@ -122,7 +138,6 @@ mod tests {
             amount_xlm:       None,
             fee_charged_stroops: None,
             timestamp:        1_700_000_000,
-            timestamp_iso:    "2023-11-15T03:13:20Z".into(),
             horizon_link:     "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             explorer_link:    "https://stellar.expert/explorer/testnet/tx/abc123".into(),
         }

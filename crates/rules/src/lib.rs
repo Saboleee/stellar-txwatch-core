@@ -130,14 +130,12 @@ pub fn evaluate(
                     label:            label.to_string(),
                     contract_id:      contract_id.to_string(),
                     network:          network.to_string(),
-                    rule_type:        rule_type(rule),
                     rule_triggered:   rule_label(rule),
                     transaction_hash: tx.hash.clone(),
                     function_name:    tx.function_name.clone(),
                     amount_xlm:       tx.amount_stroops.map(|s| s / 10_000_000),
                     fee_charged_stroops: tx.fee_charged_stroops,
                     timestamp,
-                    timestamp_iso:    timestamp_iso.clone(),
                     horizon_link:     horizon_link.clone(),
                     explorer_link:    explorer_link.clone(),
                 }),
@@ -156,7 +154,7 @@ pub fn evaluate(
         .collect()
 }
 
-fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
+pub fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
     Ok(match rule {
         AlertRule::AnyTransaction => true,
 
@@ -190,7 +188,7 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
     })
 }
 
-fn rule_label(rule: &AlertRule) -> String {
+pub fn rule_label(rule: &AlertRule) -> String {
     match rule {
         AlertRule::AnyTransaction => "AnyTransaction".into(),
         AlertRule::TransactionFailed => "TransactionFailed".into(),
@@ -207,7 +205,7 @@ fn rule_label(rule: &AlertRule) -> String {
     }
 }
 
-fn rule_type(rule: &AlertRule) -> String {
+pub fn rule_type(rule: &AlertRule) -> String {
     match rule {
         AlertRule::AnyTransaction          => "AnyTransaction".into(),
         AlertRule::TransactionFailed       => "TransactionFailed".into(),
