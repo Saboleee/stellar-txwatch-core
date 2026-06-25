@@ -26,6 +26,12 @@ pub struct HorizonTransaction {
     pub envelope_xdr: Option<String>,
     /// Base64-encoded XDR transaction result.
     pub result_xdr: Option<String>,
+    /// Memo content (text memo only).
+    #[serde(rename = "memo")]
+    pub memo: Option<String>,
+    /// Memo type (e.g., "text", "id", "hash", "return").
+    #[serde(rename = "memo_type")]
+    pub memo_type: Option<String>,
 }
 
 // ── Enriched transaction ──────────────────────────────────────────────────────
@@ -49,6 +55,10 @@ pub struct EnrichedTransaction {
     pub amount_stroops: Option<u64>,
     /// Fee charged for this transaction in stroops.
     pub fee_charged_stroops: Option<u64>,
+    /// Memo content (text memo only).
+    pub memo: Option<String>,
+    /// Memo type (e.g., "text", "id", "hash", "return").
+    pub memo_type: Option<String>,
 }
 
 impl EnrichedTransaction {
@@ -78,6 +88,8 @@ impl EnrichedTransaction {
                     .as_deref()
                     .and_then(|s| s.parse::<u64>().ok())
             }),
+            memo: tx.memo,
+            memo_type: tx.memo_type,
         })
     }
 }
@@ -155,6 +167,8 @@ pub fn evaluate(
 }
 
 pub fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
+    use txwatch_config::MemoMatchMode;
+
     Ok(match rule {
         AlertRule::AnyTransaction => true,
 
@@ -185,10 +199,40 @@ pub fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
             .fee_charged_stroops
             .map(|f| f >= *threshold_stroops)
             .unwrap_or(false),
+
+        AlertRule::MemoContains { memo_text, match_mode } => {
+            // Only applies to text memos.
+            if tx.memo_type.as_deref() != Some("text") {
+                return Ok(false);
+            }
+            let memo = match &tx.memo {
+                Some(m) => m,
+                None => return Ok(false),
+            };
+            let mode = match_mode.unwrap_or(MemoMatchMode::Exact);
+            match mode {
+                MemoMatchMode::Exact => memo == memo_text,
+                MemoMatchMode::Contains => memo.contains(memo_text.as_str()),
+                MemoMatchMode::StartsWith => memo.starts_with(memo_text.as_str()),
+            }
+        }
+
+        AlertRule::TransactionSucceeded => tx.successful,
+
+        AlertRule::SmallTransfer { min_xlm } => {
+            let threshold_stroops = min_xlm
+                .checked_mul(10_000_000)
+                .context("min_xlm overflow when converting to stroops")?;
+            tx.amount_stroops
+                .map(|s| s < threshold_stroops)
+                .unwrap_or(false)
+        }
     })
 }
 
 pub fn rule_label(rule: &AlertRule) -> String {
+    use txwatch_config::MemoMatchMode;
+
     match rule {
         AlertRule::AnyTransaction => "AnyTransaction".into(),
         AlertRule::TransactionFailed => "TransactionFailed".into(),
@@ -202,6 +246,18 @@ pub fn rule_label(rule: &AlertRule) -> String {
         AlertRule::HighFee { threshold_stroops } => {
             format!("HighFee(>={} stroops)", threshold_stroops)
         }
+        AlertRule::MemoContains { memo_text, match_mode } => {
+            let mode_str = match match_mode {
+                Some(MemoMatchMode::Exact) | None => "exact",
+                Some(MemoMatchMode::Contains) => "contains",
+                Some(MemoMatchMode::StartsWith) => "starts_with",
+            };
+            format!("MemoContains({}: {})", mode_str, memo_text)
+        }
+        AlertRule::TransactionSucceeded => "TransactionSucceeded".into(),
+        AlertRule::SmallTransfer { min_xlm } => {
+            format!("SmallTransfer(<{}XLM)", min_xlm)
+        }
     }
 }
 
@@ -209,10 +265,13 @@ pub fn rule_type(rule: &AlertRule) -> String {
     match rule {
         AlertRule::AnyTransaction          => "AnyTransaction".into(),
         AlertRule::TransactionFailed       => "TransactionFailed".into(),
+        AlertRule::TransactionSucceeded    => "TransactionSucceeded".into(),
         AlertRule::LargeTransfer { .. }   => "LargeTransfer".into(),
+        AlertRule::SmallTransfer { .. }   => "SmallTransfer".into(),
         AlertRule::FunctionCalled { .. }  => "FunctionCalled".into(),
         AlertRule::AdminFunctionCalled { .. } => "AdminFunctionCalled".into(),
         AlertRule::HighFee { .. }         => "HighFee".into(),
+        AlertRule::MemoContains { .. }    => "MemoContains".into(),
     }
 }
 
@@ -245,6 +304,8 @@ mod tests {
             function_name: function_name.map(str::to_string),
             amount_stroops,
             fee_charged_stroops: None,
+            memo: None,
+            memo_type: None,
         }
     }
 
@@ -466,6 +527,8 @@ mod tests {
             fee_charged: Some("100".into()),
             envelope_xdr: None,
             result_xdr: None,
+            memo: None,
+            memo_type: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, None, None, None).unwrap();
         assert_eq!(enriched.timestamp.year(), 2024);

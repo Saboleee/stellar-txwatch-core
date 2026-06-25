@@ -56,16 +56,27 @@ impl fmt::Display for Network {
 
 // ── AlertRule ─────────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoMatchMode {
+    Exact,
+    Contains,
+    StartsWith,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 pub enum AlertRule {
     AnyTransaction,
     TransactionFailed,
+    TransactionSucceeded,
     LargeTransfer       { threshold_xlm: u64 },
+    SmallTransfer       { min_xlm: u64 },
     FunctionCalled      { function_name: String },
     AdminFunctionCalled { function_names: Vec<String> },
     /// Fires when the transaction's fee (in stroops) exceeds the threshold.
     HighFee             { threshold_stroops: u64 },
+    MemoContains        { memo_text: String, match_mode: Option<MemoMatchMode> },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -119,6 +130,23 @@ impl AlertRule {
                     );
                 }
             }
+            AlertRule::MemoContains { memo_text, .. } => {
+                if memo_text.trim().is_empty() {
+                    bail!(
+                        "contract '{}': MemoContains memo_text must not be empty",
+                        contract_label
+                    );
+                }
+            }
+            AlertRule::SmallTransfer { min_xlm } => {
+                if *min_xlm == 0 {
+                    bail!(
+                        "contract '{}': SmallTransfer min_xlm must be > 0",
+                        contract_label
+                    );
+                }
+            }
+            AlertRule::TransactionSucceeded => {}
         }
         Ok(())
     }
